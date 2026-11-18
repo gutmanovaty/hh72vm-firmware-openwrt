@@ -1,0 +1,15 @@
+# Downloaded upstream release archives and binaries
+hh71vm-openwrt-flash-bundle/
+*.zip
+*.sha256
+*.bin
+
+# Cloned upstream source repositories (managed separately)
+hh71vm-openwrt/
+unifi-openwrt/
+
+# Device-unique backups and local environment secrets
+backup-stock*/
+.env
+*.log
+*.raw.txt
