@@ -13,3 +13,5 @@ backup-stock*/
 .env
 *.log
 *.raw.txt
+__pycache__/
+*.pyc
