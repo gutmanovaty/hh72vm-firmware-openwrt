@@ -1,0 +1,22 @@
+#!/bin/sh
+# The set of captured interfaces is "everything except the way out", so it changes when
+# the way out does: the modem coming back, or a cable making the combined port the WAN.
+# Recompute and reinstall on those events. `restore` is a no-op unless the connection is
+# meant to be up and the mode is vpn, so this costs nothing when Xray is not in use.
+
+[ "$ACTION" = "ifup" ] || [ "$ACTION" = "ifdown" ] || exit 0
+
+# Debounce, keeping the LAST event of a burst: several interfaces change at once at boot
+# and on a modem reconnect, and the rules have to match the state after the burst. The
+# earlier version acted on the first event and dropped the rest, so a quick ifdown/ifup
+# left the rules computed for the state in between. Each event stamps its own token and
+# waits; only the one whose token is still current afterwards rebuilds the rules.
+STAMP=/var/run/xray-hotplug.stamp
+token="$$.$(cut -d' ' -f1 /proc/uptime)"
+echo "$token" > "$STAMP"
+(
+	sleep 5
+	[ "$(cat "$STAMP" 2>/dev/null)" = "$token" ] || exit 0
+	/usr/sbin/hh71vm-xray-fw restore
+) </dev/null >/dev/null 2>&1 &
+exit 0

@@ -1,0 +1,47 @@
+#!/bin/sh /etc/rc.common
+# Start the services of packages installed onto the /mnt/extern share.
+#
+# opkg runs a package's postinst with IPKG_INSTROOT pointing at the destination, so a
+# service installed with `-d extern` gets its enable symlink under
+# /mnt/extern/opkg/etc/rc.d/ instead of /etc/rc.d/.  Nothing in procd looks there, so
+# without this the service is installed, enabled, and never started.
+#
+# START is 95 so this runs after hh71vm-extern (94) has had its turn at mounting the
+# share.  That helper mounts in the background and retries, so the share can still be
+# late; a service that must survive that is better shipped as a small overlay package
+# whose init script waits for the share before it starts the real binary.
+
+START=95
+STOP=10
+
+# Where the share is mounted is configurable, so the scripts, their links and their
+# binaries are all looked up under the same configured prefix.
+extern_prefix() {
+	target=$(uci -q get hh71vm-extern.extern.target || echo /mnt/extern)
+	echo "$target/opkg"
+}
+
+for_each_service() {
+	action="$1"
+	prefix=$(extern_prefix)
+	rc_d="$prefix/etc/rc.d"
+	[ -d "$rc_d" ] || return 0
+	for link in "$rc_d"/S*; do
+		[ -e "$link" ] || continue
+		script="${prefix}/etc/init.d/$(basename "$link" | sed 's/^S[0-9]*//')"
+		[ -x "$script" ] || continue
+		echo "hh71vm-extern-services: $action $script"
+		PATH="${prefix}/usr/sbin:${prefix}/usr/bin:$PATH" \
+		LD_LIBRARY_PATH="${prefix}/usr/lib:${prefix}/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
+			"$script" "$action"
+	done
+}
+
+start() {
+	[ ! -e /etc/hh71vm-extern-reset-pending ] || return 0
+	for_each_service start
+}
+
+stop() {
+	for_each_service stop
+}

@@ -1,0 +1,64 @@
+name: Validate public release
+
+on:
+  push:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Check out repository
+        with:
+          persist-credentials: false
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+
+      - name: Install loader dependency
+        run: python -m pip install -r tools/requirements.txt
+
+      - name: Check workflow syntax
+        run: sh autobuild/check-workflows.sh "$RUNNER_TEMP/actionlint"
+
+      - name: Rebuild helper executables from source
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-arm-linux-gnueabi binutils-arm-linux-gnueabi cmake squashfs-tools
+          sh autobuild/install-usign.sh "$RUNNER_TEMP/usign"
+          echo "$RUNNER_TEMP/usign/build" >> "$GITHUB_PATH"
+          sh openwrt-feed/package/utils/modem-extra-tools/build-helper.sh
+
+      - name: Run publication and loader tests
+        run: python -m unittest discover -s tests -v
+
+      - name: Check Python syntax
+        run: >-
+          python -m py_compile
+          tools/ram_boot.py
+          autobuild/build.py
+          autobuild/common.py
+          autobuild/flash_bundle.py
+          autobuild/inspect_image.py
+          autobuild/publish.py
+          tools/verify_bundle.py
+          openwrt-feed/target/linux/rtkmipsel/image/mkrtkimg.py
+
+      - name: Check installer syntax
+        run: |
+          sh -n autobuild/package/hh71vm-feed/files/reconcile.sh
+          sh -n autobuild/install-usign.sh
+
+      - name: Run modem backend unit tests
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y lua5.1
+          lua5.1 tests/test_modem_sms.lua openwrt-feed/target/linux/rtkmipsel/base-files/usr/sbin/hh71vm-modemd
+          lua5.1 tests/test_modem_apn.lua openwrt-feed/target/linux/rtkmipsel/base-files/usr/sbin/hh71vm-modemd
+          lua5.1 tests/test_modem_restart.lua openwrt-feed/target/linux/rtkmipsel/base-files/usr/sbin/hh71vm-modemd
+          lua5.1 tests/test_sms_to_telegram_engine.lua openwrt-feed/package/utils/sms-to-telegram/files/sms_to_telegram.lua
+          node tests/test_sms_luci.js openwrt-feed/package/luci/applications/luci-app-hh71vm-modem/htdocs/luci-static/resources/view/hh71vm/sms.js
+          cd openwrt-feed/package/utils/modem-extra-tools
+          lua5.1 tests/unit.lua files
+          cd ../sms-to-telegram
+          lua5.1 tests/unit.lua files

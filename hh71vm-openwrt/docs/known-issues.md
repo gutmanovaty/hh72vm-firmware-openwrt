@@ -1,0 +1,245 @@
+# Known issues
+
+Do not file a new bug for an item already listed here unless your result adds materially
+different evidence.
+
+Items are grouped by what they apply to. Artifact-level verification is kept separate from
+the behavior already observed on the reference device.
+
+## Security limitations
+
+- **No root password is set.** Set one at the first login. Until you do, SSH and LuCI must
+  not be reachable from an untrusted network.
+- **Both Wi-Fi networks use the public key `hh71vm12345`.** Change both before use.
+- **The Qualcomm half (`192.168.225.1`) is not reachable from LAN or Wi-Fi clients.** Its
+  telnet, control and file-sharing services have no authentication of their own, so the
+  firewall rule `Block-LAN-to-Qualcomm` rejects forwarded traffic to it. The router's own
+  connections are unaffected. To open the stock web UI from a PC, disable that rule
+  temporarily instead of deleting it; a deleted rule is added back after `sysupgrade`.
+- **Xray's SOCKS and HTTP inbounds accept anyone who can reach the router.** While Xray is
+  running they listen on every interface (ports 1080 and 1081 by default) with no
+  authentication, and they exist in **VPN mode as well as proxy mode** - VPN mode uses them
+  for its own probe and API. The `wan` zone rejects input, so this is not reachable from the
+  internet unless you forward a port, but every LAN and Wi-Fi client can use the router as an
+  open proxy while Xray is up. This is deliberate, so a client left out of the VPN capture can
+  still reach the tunnel. Xray is not installed by default.
+- **Some vendor procfs controls still have overly broad permissions.** Reducing permissions
+  on entries that can expose key material is outstanding.
+- **Logs can contain unique identifiers.** Redact MAC addresses, serial numbers, IMEI/IMSI,
+  SIM data, phone numbers, messages, credentials, and keys before posting.
+
+## Hardware coverage
+
+The port has been validated on one HH71VM. Other HH71VM board revisions, regional
+variants, RF front ends, carrier variants, and flash layouts remain unverified.
+
+The build selects these reference-unit values:
+
+- SoC radio: `SOC_RFE_TYPE_1`;
+- PCIe 5 GHz radio: `RTL8812FE`, slot 0, `SLOT_0_RFE_TYPE_0`;
+- external gigabit PHY on switch port 0, MDIO address 6.
+
+A unit with different hardware may boot but have reduced radio performance, unstable links,
+or no networking. Report marker differences.
+
+## Installing and updating
+
+- The installer writes the kernel and root filesystem only. The bootloader, `hwsetting`,
+  vendor configuration, and vendor JFFS2 partition are not written.
+- The first boot after a fresh installation takes about two minutes while the settings
+  partition is erased. It is not a hang.
+- For the first minute or two after a fresh installation, SSH can refuse the empty root
+  password while the settings partition is still being built. LuCI accepts you during the
+  same period, and the problem clears by itself.
+- A `sysupgrade` that keeps settings also keeps files you changed on the running system, and
+  those copies continue to take precedence over the versions in the new image. Use
+  `sysupgrade -n` when you want the image contents exactly as built.
+- Rollback uses the backup taken during installation. A Realtek dump from another HH71VM may
+  in theory work as well, but this has not been verified.
+
+## Modem and LuCI limitations
+
+- Modem control-channel preparation has occasionally taken roughly 3-9 minutes.
+- **SMS delivery depends on the mobile service.** Message composition, encoding, and multipart
+  segmentation are implemented, but delivery confirmation depends on the modem, SIM, and
+  carrier service.
+- A message the network refuses takes the modem about four minutes to report, and the modem
+  pages stall for that time because the single AT channel is busy with it. The channel
+  survives, and the failure is written to the system log.
+- Long-term reconnect behavior after a Qualcomm-side restart is not yet validated.
+- Some radio/scan signal and mode fields in the UI still need audit or clearer handling.
+- Settings changed through the modem pages act on the separate Qualcomm subsystem and may
+  persist there. Rebooting or reinstalling the Realtek side is not guaranteed to undo them.
+- An IMEI restore verifies the Qualcomm NV 550 write by reading that NV item back. A fresh
+  `ATI` query refreshes the main Modem overview, but neither result proves that the running
+  modem or mobile network is using the restored identity. After a successful restore, fully
+  shut down the router, disconnect power, and then power it on again. The implemented
+  OpenWrt reboot path resets the Realtek SoC and has no confirmed Qualcomm reset step, so
+  it is not a substitute for this power cycle.
+- **A carrier SIM lock can now be read, set and removed.** Modem > Overview reports whether
+  a lock is in force and carries the removal controls; Extra tools can lock the router to the
+  network of the SIM currently in it. The state is read from the modem itself, because the
+  Qualcomm control service lags a write by several seconds and does not report an armed lock
+  at all. A wrong unlock code costs one of the ten attempts the modem allows and the counter
+  cannot be reset, so a code that has already been sent is never resent automatically. This
+  was verified on the reference unit; other carrier variants, and units locked by a carrier
+  rather than by this firmware, are untested. IMEI restoration, TTL normalization, LTE band
+  preferences and SIM PIN handling remain separate operations.
+- **Restarting the modem from the Overview page parks and re-enables the radio
+  (`AT+CFUN=0` then `AT+CFUN=1`), confirmed live 2026-09-15.** An earlier version sent
+  `AT+CFUN=1,1` (a full Qualcomm baseband reset) instead; that took the whole board down,
+  because the USB gadget that carries both the AT channel and `eth2` belongs to the
+  Qualcomm side, and the Realtek kernel does not survive that `eth2` disconnect. There is
+  still no confirmed way to reset just the Qualcomm baseband on this hardware short of an
+  actual power cycle. See [modem control](extra/modem-control.md#restart-the-modem).
+- **The APN reconciler now leaves a context alone once the SIM identity it was saved for no
+  longer matches the card in the slot**, and no longer force-corrects a PDP-type-only
+  difference (only APN and auth type are enforced). An entry saved before this change has no
+  identity yet and silently adopts whichever SIM is seen first; save the APN again through
+  the Profiles page after swapping SIMs if in doubt.
+
+## Xray VPN mode and the router's own DNS
+
+- **VPN-mode capture rules are only installed while Xray is actually up and listening**, not
+  merely while the connection is set to be up. A router that is not asked to connect
+  automatically at power-on (autostart off) keeps whatever it was doing before a reboot only
+  through the Connect button; the redirect and the DNS override are removed rather than
+  installed for a tunnel that never starts, which used to break the LAN's own DNS and TCP
+  after a power cycle. `hh71vm-xray-fw arm` (at start) and the watchdog's own capture check
+  (afterwards, every ~90s of disagreement) are what install and remove them as reality
+  changes; the watchdog needs to stay enabled (it is, by default) for the second half of
+  that.
+- **"Connect automatically on router power on" together with a status page opened before the
+  first status poll could exec a second 34 MB Xray process alongside the one already
+  running**, on a board with no swap -- a plausible mechanism for a LuCI crash reported
+  alongside this fix (`[UNVERIFIED]`, not reproduced independently). The version string LuCI
+  shows is now written once by the launcher itself, right before it execs Xray, instead of
+  ever being re-derived by running the binary while it is already resident.
+
+## Wi-Fi encryption on older images
+
+Older images can offer WEP for the custom `rtl8192cd` radios even though their netifd handler
+rejects it. Applying WEP can leave the radio down. The supported choices are an open network
+or WPA2-PSK with CCMP/AES; `wpa2` by itself means WPA2-Enterprise and is not a substitute.
+
+Until an image containing the LuCI capability fix is installed, the following recovery can
+be applied through SSH to each affected `wifi-iface`. This procedure follows the current
+generator and netifd contract but has not yet been independently validated on hardware:
+
+```sh
+uci set wireless.default_radio0.encryption='psk2+ccmp'
+uci set wireless.default_radio0.key='REPLACE_WITH_8_TO_63_ASCII_CHARACTERS'
+uci set wireless.default_radio1.encryption='psk2+ccmp'
+uci set wireless.default_radio1.key='REPLACE_WITH_8_TO_63_ASCII_CHARACTERS'
+uci commit wireless
+wifi reload
+```
+
+Confirm the actual section names before running the commands; `default_radio0` and
+`default_radio1` are factory defaults, not a universal promise. Do not change the radio
+device type, install hostapd/wpad as a workaround, or select `mac80211`/`broadcom`.
+
+## Installing packages over the mobile link
+
+When the only uplink is the mobile connection, some carriers rewrite plain HTTP, which breaks
+`opkg` in a misleading way: the reported failure is `Signature check failed`, as though the
+signing keys were wrong. Use HTTPS package feeds on such a connection.
+
+## Network-driver quirks
+
+`ip link` may not show Ethernet carrier correctly because the vendor driver does not update
+the standard carrier state. Use:
+
+```sh
+cat /proc/rtl865x/port_status
+cat /proc/eth0/link_status
+```
+
+The switch is named `switch0`:
+
+```sh
+swconfig list
+swconfig dev switch0 show
+```
+
+Some vendor Wi-Fi proc counters are incomplete. In particular, `/proc/wlanX/sta_info` and
+several fields under `/proc/wlanX/stats` may not reflect active traffic reliably. Prefer
+`iwinfo`, DHCP leases, ARP entries, and an actual traffic test.
+
+The two radio interfaces currently use the same default MAC behavior. Record observations,
+but redact unique addresses in public reports.
+
+## SSH and file transfer
+
+The bundled Dropbear offers the legacy `ssh-rsa` host-key algorithm:
+
+```text
+ssh -o HostKeyAlgorithms=+ssh-rsa root@192.168.1.1
+```
+
+If a previous session used another host key:
+
+```text
+ssh-keygen -R 192.168.1.1
+```
+
+The image has no SFTP server. Use legacy SCP mode, with the same host-key option:
+
+```text
+scp -O -o HostKeyAlgorithms=+ssh-rsa local-file root@192.168.1.1:/tmp/
+```
+
+## Xray VPN (experimental)
+
+Shipped early on purpose. Read [Xray VPN](extra/xray-vpn.md) before installing it.
+
+- **Only clients that route through this router are captured.** If the router is wired as a
+  dumb access point, with its LAN bridged to another router that hands out the addresses,
+  its clients belong to that other router: their traffic never passes through here and
+  nothing can redirect it. The page will say connected, and devices will still show their
+  own address. A router serving its own DHCP - on the SIM or behind a WAN cable - captures
+  its clients normally.
+- **UDP other than DNS is not carried through the tunnel**, and capturing it is off by
+  default. Xray reads the captured packet, tunnels it, the far end answers, and the reply is
+  never written back on this hardware, so the traffic would vanish rather than go out
+  unproxied. QUIC is rejected instead so browsers fall back to TCP, and DNS is tunnelled
+  through `dnsmasq`. There is a switch to try it anyway; expect it not to work.
+- **IPv6 is not tunnelled** and forwarded IPv6 to global addresses is rejected while VPN
+  mode is on, so that it cannot leak around the tunnel.
+- **`geoip.dat` and `geosite.dat` are not installed**, so any routing rule naming `geoip:`
+  or `geosite:` fails at start. They are about 20 MB against about 21 MB free on the shared
+  storage. Split routing is therefore unavailable.
+- **The tunnel is CPU-bound at about 12 Mbit/s** with REALITY, about 27 for VMess over
+  plain TCP. That is the processor, not the connection.
+- **The board has no battery-backed clock**, so every boot starts at a fixed date in the
+  past. `sysntpd` is enabled and corrects it within seconds *once the router has working
+  internet*, so this only bites before the first successful connection. Until then the date
+  is years out, which breaks anything that validates a TLS certificate (a certificate that is
+  not valid yet), and fails VMess with `invalid user`, a message that names the wrong thing.
+  Xray can also set the clock from its own connection.
+- **The tunnel over the mobile connection is untested.** Everything was measured with the
+  router's uplink on a cable. Nothing in the design depends on which interface the default
+  route uses, but that is not the same as having run it.
+- **RAM slowly fills up while Xray runs, eventually producing `Failed to create CGI process:
+  Out of memory` in LuCI; only a reboot recovered.** The root cause is an upstream connection
+  leak in the `reality` library bundled with Xray-core v26.3.27 (XTLS/Xray-core#6684): a peer
+  that goes silent without a clean FIN/RST is never reclaimed, and this router's LTE uplink
+  produces exactly that peer behavior. Mitigated by pinning a newer `reality` dependency
+  (commit `8056be3`, "Try pass RST") plus TCP keepalive on the proxy socket, `policy`
+  connection-idle/handshake limits, a `GOMEMLIMIT`/`GOGC` ceiling on the Xray process, and an
+  RSS guard added to the reconnect watchdog that restarts Xray if its memory stays over a
+  threshold for several consecutive checks. See [memory on a 128 MiB
+  board](extra/xray-vpn.md#memory-on-a-128-mib-board) for the settings involved. If the RSS
+  guard has fired, the system log carries a line from the `xray-watchdog` tag reading
+  `recycling: RSS stayed over ... MiB for ... checks`, and
+  `/var/run/xray.watchdog.json` records it under `mem_guard_last` / `mem_guard_fired`. A
+  multi-hour soak test against real traffic on the mobile uplink is still needed to confirm
+  these bounds hold in practice; only the RAM-exhaustion mechanism itself and the settings
+  that bound it have been verified so far.
+
+## Not yet independently reproduced
+
+The included source state, build configuration, base revision, and feed revisions were
+captured from the release build. A second clean-checkout build has not yet independently
+reproduced every published SHA-256. See [sources and build instructions](sources.md) for the
+exact verification targets.

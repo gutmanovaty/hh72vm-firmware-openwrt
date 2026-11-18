@@ -1,0 +1,615 @@
+#!/bin/sh
+# SPDX-License-Identifier: Apache-2.0
+set -eu
+
+repository='https://github.com/gutmanovaty/hh72vm-firmware-openwrt'
+asset='openwrt-rtkmipsel-rtl8197f-hh71vm-sysupgrade.bin'
+latest="$repository/releases/latest/download"
+keep_config=1
+check_only=0
+force=0
+assume_yes=0
+json_mode=0
+status_only=0
+history_only=0
+expected_tag=
+start_job=0
+worker=0
+job_json=0
+job_owner=0
+job_state_file=/var/run/autosysupgrade.json
+lock=/tmp/autosysupgrade.lock
+job_log=/var/run/autosysupgrade.log
+check_budget_seconds=15
+required_request_timeout=8
+optional_request_timeout=5
+
+usage() {
+  cat <<'EOF'
+Usage: autosysupgrade [-n] [--check] [--force]
+
+Download and verify the latest HH71VM sysupgrade image.
+  -n            do not preserve the current configuration
+  --check       verify availability and compatibility without upgrading
+  --force       allow reinstalling the same Release or replacing a newer build
+
+LuCI integration options:
+  --status-json print the installed build as JSON without network access
+  --check-json  verify signed release metadata and print JSON without downloading the image
+  --history-json print optional signed release history as JSON
+  --yes         skip the interactive prompt after all verification succeeds
+  --expected ID refuse to upgrade if the latest Release changed after checking
+  --start-job   with --expected: run the upgrade in the background and return at once
+  --job-json    print the state of the background upgrade job as JSON
+EOF
+}
+
+# The background job reports where it is, so the web page can follow a download that
+# outlives any single RPC (LuCI gives up after 20 s, rpcd kills a call after 60 s).
+# Only the process that owns the job writes it: a second Upgrade click that finds the
+# lock taken must not overwrite the state of the job that holds it.
+job_state() {
+  [ "$job_owner" = 1 ] || return 0
+  job_error=$(printf '%s' "${2:-}" | tr -d '\r\n' | sed 's/\\/\\\\/g; s/"/\\"/g')
+  printf '{"state":"%s","expected":"%s","error":"%s","updated":%s}\n' \
+    "$1" "$expected_tag" "$job_error" "$(date +%s)" > "$job_state_file.tmp" &&
+    mv -f "$job_state_file.tmp" "$job_state_file"
+}
+
+fail() {
+  echo "autosysupgrade: $1" >&2
+  job_state failed "$1"
+  exit 1
+}
+
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    -n) keep_config=0 ;;
+    --check) check_only=1 ;;
+    --force) force=1 ;;
+    --yes) assume_yes=1 ;;
+    --expected)
+      [ "$#" -ge 2 ] || { usage >&2; exit 2; }
+      expected_tag=$2
+      shift
+      ;;
+    --start-job) start_job=1 ;;
+    --job-worker) worker=1; assume_yes=1 ;;
+    --job-json) job_json=1 ;;
+    --status-json) status_only=1; json_mode=1 ;;
+    --check-json) check_only=1; json_mode=1 ;;
+    --history-json) check_only=1; json_mode=1; history_only=1 ;;
+    -h|--help) usage; exit 0 ;;
+    *) usage >&2; exit 2 ;;
+  esac
+  shift
+done
+
+if [ "$job_json" = 1 ]; then
+  # A job whose process is gone without saying so failed; say that instead of
+  # leaving the page waiting on a state that will never change.
+  [ -f "$job_state_file" ] || { echo '{"state":"idle"}'; exit 0; }
+  job_now=$(sed -n 's/.*"state":"\([a-z]*\)".*/\1/p' "$job_state_file")
+  case "$job_now" in
+    starting|checking|downloading|verifying)
+      job_pid=$(cat "$lock/pid" 2>/dev/null || true)
+      case "$job_pid" in
+        ''|*[!0-9]*) job_alive=0 ;;
+        *) kill -0 "$job_pid" 2>/dev/null && job_alive=1 || job_alive=0 ;;
+      esac
+      if [ "$job_alive" = 0 ]; then
+        expected_tag=$(sed -n 's/.*"expected":"\([^"]*\)".*/\1/p' "$job_state_file")
+        job_owner=1
+        job_state failed 'the upgrade job stopped before flashing; nothing was written'
+      fi
+      ;;
+  esac
+  cat "$job_state_file"
+  exit 0
+fi
+
+[ "$status_only" = 0 ] || {
+  [ "$check_only" = 0 ] && [ "$force" = 0 ] && [ "$assume_yes" = 0 ] &&
+    [ "$keep_config" = 1 ] && [ -z "$expected_tag" ] ||
+    fail '--status-json cannot be combined with other options'
+}
+[ "$json_mode" = 0 ] || [ "$assume_yes" = 0 ] || fail '--yes cannot be combined with JSON output'
+[ "$history_only" = 0 ] || [ -n "$expected_tag" ] || fail '--history-json requires --expected ID'
+[ "$start_job" = 0 ] || [ -n "$expected_tag" ] || fail '--start-job requires --expected ID'
+[ "$start_job" = 0 ] || { [ "$json_mode" = 0 ] && [ "$check_only" = 0 ]; } ||
+  fail '--start-job cannot be combined with checks or JSON output'
+
+[ "$(id -u)" = 0 ] || fail 'must be run as root'
+[ "$(cat /tmp/sysinfo/board_name 2>/dev/null || true)" = hh71vm ] ||
+  fail 'this updater is only for the HH71VM OpenWrt image'
+
+data=/rom/usr/share/hh71vm-feed
+[ -f "$data/release.pub" ] && [ -f "$data/release.conf" ] || data=/usr/share/hh71vm-feed
+[ -f "$data/release.pub" ] && [ -f "$data/release.conf" ] ||
+  fail 'the installed image trust anchor is missing'
+
+installed=$(awk -F= '$1 == "release" { print $2 }' "$data/release.conf")
+
+valid_tag() {
+  printf '%s\n' "$1" | grep -Eq '^hh71vm-([0-9a-f]{12}-r[1-9][0-9]*-a[1-9][0-9]*|r[0-9]{20}-a[0-9]{6}-[0-9a-f]{12})$'
+}
+
+release_run() {
+  case "$1" in
+    hh71vm-r*-a*-*) value=${1#hh71vm-r}; value=${value%%-a*} ;;
+    *) value=${1#*-r}; value=${value%%-a*} ;;
+  esac
+  while [ "${value#0}" != "$value" ]; do value=${value#0}; done
+  printf '%s\n' "${value:-0}"
+}
+
+release_attempt() {
+  case "$1" in
+    hh71vm-r*-a*-*) value=${1#*-a}; value=${value%%-*} ;;
+    *) value=${1##*-a} ;;
+  esac
+  while [ "${value#0}" != "$value" ]; do value=${value#0}; done
+  printf '%s\n' "${value:-0}"
+}
+
+valid_date() {
+  printf '%s\n' "$1" | grep -Eq '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$'
+}
+
+emit_local_status() {
+  JSON_PREFIX=${JSON_PREFIX:-}
+  set +u
+  . /usr/share/libubox/jshn.sh
+  json_init
+  json_add_string current "$installed"
+  json_add_string current_published_at ""
+  json_add_boolean checked 0
+  json_dump
+  set -u
+}
+
+if [ "$status_only" = 1 ]; then
+  for command in awk grep; do
+    command -v "$command" >/dev/null 2>&1 || fail "required command is missing: $command"
+  done
+  [ -f /usr/share/libubox/jshn.sh ] || fail 'required JSON library is missing'
+  valid_tag "$installed" || fail 'the installed release identity is invalid'
+  emit_local_status
+  exit 0
+fi
+
+for command in uclient-fetch usign jsonfilter sha256sum sysupgrade mktemp awk grep sort date; do
+  command -v "$command" >/dev/null 2>&1 || fail "required command is missing: $command"
+done
+[ -f /usr/share/libubox/jshn.sh ] || fail 'required JSON library is missing'
+valid_tag "$installed" || fail 'the installed release identity is invalid'
+[ -z "$expected_tag" ] || valid_tag "$expected_tag" || fail 'the expected release identity is invalid'
+
+acquire_lock() {
+  if mkdir "$lock" 2>/dev/null; then
+    printf '%s\n' "$$" > "$lock/pid" || {
+      rm -f "$lock/pid"
+      rmdir "$lock" 2>/dev/null || true
+      fail 'cannot record updater lock ownership'
+    }
+    return
+  fi
+
+  [ -d "$lock" ] && [ ! -L "$lock" ] || fail 'the updater lock path is unsafe'
+  lock_pid=$(cat "$lock/pid" 2>/dev/null || true)
+  if [ -z "$lock_pid" ]; then
+    sleep 1
+    lock_pid=$(cat "$lock/pid" 2>/dev/null || true)
+  fi
+  case "$lock_pid" in
+    ''|*[!0-9]*) ;;
+    *) kill -0 "$lock_pid" 2>/dev/null && fail 'another autosysupgrade process is already running' ;;
+  esac
+  rm -f "$lock/pid"
+  rmdir "$lock" 2>/dev/null || fail 'the stale updater lock could not be removed safely'
+  mkdir "$lock" 2>/dev/null || fail 'another autosysupgrade process is already running'
+  printf '%s\n' "$$" > "$lock/pid" || {
+    rm -f "$lock/pid"
+    rmdir "$lock" 2>/dev/null || true
+    fail 'cannot record updater lock ownership'
+  }
+}
+
+lock_acquired=0
+if [ "$worker" = 1 ]; then
+  # The starter took the lock and wrote this process's pid into it.
+  lock_acquired=1
+  job_owner=1
+elif [ "$history_only" = 0 ]; then
+  acquire_lock
+  lock_acquired=1
+fi
+
+if [ "$start_job" = 1 ]; then
+  job_owner=1
+  job_state starting
+  set -- --job-worker --expected "$expected_tag"
+  [ "$keep_config" = 1 ] || set -- "$@" -n
+  [ "$force" = 0 ] || set -- "$@" --force
+  # No inherited descriptors: rpcd waits for this call's stdout to close, and the
+  # job has to outlive the call.
+  sh "$0" "$@" </dev/null >"$job_log" 2>&1 &
+  printf '%s\n' "$!" > "$lock/pid"
+  lock_acquired=0
+  printf '{"started":true,"expected":"%s"}\n' "$expected_tag"
+  exit 0
+fi
+temporary=$(mktemp -d /tmp/autosysupgrade.XXXXXX) || {
+  if [ "$lock_acquired" = 1 ]; then
+    rm -f "$lock/pid"
+    rmdir "$lock"
+  fi
+  fail 'cannot create a temporary directory'
+}
+cleanup() {
+  rm -f "$temporary"/*
+  rmdir "$temporary" 2>/dev/null || true
+  if [ "$lock_acquired" = 1 ]; then
+    rm -f "$lock/pid"
+    rmdir "$lock" 2>/dev/null || true
+  fi
+}
+trap cleanup EXIT HUP INT TERM
+
+check_deadline=$(($(date +%s) + check_budget_seconds))
+
+budget_timeout() {
+  maximum=$1
+  remaining=$((check_deadline - $(date +%s)))
+  [ "$remaining" -gt 0 ] || return 1
+  [ "$remaining" -ge "$maximum" ] || maximum=$remaining
+  printf '%s\n' "$maximum"
+}
+
+try_required_download() {
+  timeout=$(budget_timeout "$required_request_timeout") || return 1
+  rm -f "$2"
+  uclient-fetch -q -T "$timeout" -O "$2" "$1" >/dev/null 2>&1 && [ -s "$2" ]
+}
+
+download_metadata_pair() {
+  first_ok=1
+  second_ok=1
+  try_required_download "$1" "$2" &
+  first_pid=$!
+  try_required_download "$3" "$4" &
+  second_pid=$!
+  wait "$first_pid" || first_ok=0
+  wait "$second_pid" || second_ok=0
+  if [ "$first_ok" != 1 ] || [ "$second_ok" != 1 ]; then
+    [ "$(date +%s)" -lt "$check_deadline" ] || fail 'firmware update check timed out'
+    fail 'cannot download signed release metadata'
+  fi
+}
+
+try_download() {
+  timeout=$(budget_timeout "$optional_request_timeout") || return 1
+  rm -f "$2"
+  # The exit status is passed through instead of being collapsed to a boolean.
+  # 8 is an HTTP error answer, which for a release asset means the tag carries
+  # no such file, and that is a different thing from a network failure (4).
+  uclient-fetch -q -T "$timeout" -O "$2" "$1" >/dev/null 2>&1 || return $?
+  [ -s "$2" ] || return 1
+}
+
+try_download_pair() {
+  try_download "$1" "$2" &
+  first_pid=$!
+  try_download "$3" "$4" &
+  second_pid=$!
+  first_rc=0
+  second_rc=0
+  wait "$first_pid" || first_rc=$?
+  wait "$second_pid" || second_rc=$?
+  if [ "$first_rc" = 0 ] && [ "$second_rc" = 0 ]; then return 0; fi
+  # Neither half present: this tag publishes no descriptor at all.
+  if [ "$first_rc" = 8 ] && [ "$second_rc" = 8 ]; then return 8; fi
+  return 1
+}
+
+download_image() {
+  uclient-fetch -q -T 60 -O "$2" "$1" || fail 'firmware image download failed'
+  [ -s "$2" ] || fail 'firmware image download is empty'
+}
+
+descriptor_value() {
+  jsonfilter -i "$descriptor_file" -e "@.$1" 2>/dev/null || true
+}
+
+verify_descriptor() {
+  descriptor_file=$1
+  descriptor_signature=$2
+  expected_tag=$3
+  usign -V -p "$data/release.pub" -m "$descriptor_file" \
+    -x "$descriptor_signature" >/dev/null 2>&1 || return 1
+  descriptor_schema=$(descriptor_value schema)
+  descriptor_architecture=$(descriptor_value architecture)
+  descriptor_tag=$(descriptor_value tag)
+  descriptor_key_id=$(descriptor_value key_id)
+  descriptor_url=$(descriptor_value feed_url)
+  [ "$descriptor_schema" = 1 ] &&
+    [ "$descriptor_architecture" = mipsel_24kc ] &&
+    [ "$descriptor_tag" = "$expected_tag" ] &&
+    valid_tag "$descriptor_tag" &&
+    [ "$descriptor_key_id" = "$trusted_key_id" ] &&
+    [ "$descriptor_url" = "$repository/releases/download/$descriptor_tag" ]
+}
+
+collect_history_jobs() {
+  while IFS='|' read -r download_pid index history_tag history_date; do
+    [ -n "$download_pid" ] || continue
+    download_rc=0
+    wait "$download_pid" || download_rc=$?
+    if [ "$download_rc" = 0 ] &&
+       verify_descriptor "$temporary/history.$index.json" "$temporary/history.$index.sig" "$history_tag"; then
+      printf '%s|%s|%s\n' "$index" "$history_tag" "$history_date" >> "$temporary/history"
+      [ "$history_tag" != "$installed" ] || current_published_at=$history_date
+    elif [ "$download_rc" = 8 ]; then
+      # The feed lists every tag, and this repository has tags that were never
+      # published as a Release; those carry no descriptor.  Skipping one is not
+      # an incomplete history, so it must not raise the warning -- that warning
+      # is for a descriptor that exists and could not be fetched or verified.
+      :
+    else
+      history_complete=0
+    fi
+  done < "$temporary/history-jobs"
+  : > "$temporary/history-jobs"
+}
+
+job_state checking
+trusted_key_id=$(usign -F -p "$data/release.pub" 2>/dev/null) ||
+  fail 'cannot read the installed trust anchor'
+if [ "$history_only" = 1 ]; then
+  tag=$expected_tag
+else
+  [ "$json_mode" = 1 ] || echo 'Downloading the signed latest-release descriptor...'
+  download_metadata_pair \
+    "$latest/release.json" "$temporary/release.json" \
+    "$latest/release.json.sig" "$temporary/release.json.sig"
+  descriptor_file="$temporary/release.json"
+  tag=$(jsonfilter -i "$descriptor_file" -e '@.tag' 2>/dev/null || true)
+  valid_tag "$tag" || fail 'invalid Release tag'
+  [ -z "$expected_tag" ] || [ "$tag" = "$expected_tag" ] ||
+    fail 'the latest Release changed after the update check; check again before upgrading'
+  verify_descriptor "$temporary/release.json" "$temporary/release.json.sig" "$tag" ||
+    fail 'release descriptor verification failed'
+  image_url=$descriptor_url
+  [ "$image_url" = "$repository/releases/download/$tag" ] || fail 'invalid immutable Release URL'
+  checksum=$(awk -v key="\"$asset\":" '
+    $1 == key && $2 ~ /^"[0-9a-f]+",?$/ {
+      gsub(/[",]/, "", $2)
+      print $2
+    }
+  ' "$temporary/release.json")
+  [ "${#checksum}" = 64 ] || fail 'the image checksum is missing or invalid'
+  case "$checksum" in *[!0-9a-f]*) fail 'the image checksum is invalid' ;; esac
+fi
+
+installed_run=$(release_run "$installed")
+installed_attempt=$(release_attempt "$installed")
+latest_run=$(release_run "$tag")
+latest_attempt=$(release_attempt "$tag")
+update_available=0
+installed_newer=0
+if [ "$installed_run" -lt "$latest_run" ]; then
+  update_available=1
+elif [ "$installed_run" -gt "$latest_run" ]; then
+  installed_newer=1
+elif [ "$installed_attempt" -lt "$latest_attempt" ]; then
+  update_available=1
+elif [ "$installed_attempt" -gt "$latest_attempt" ]; then
+  installed_newer=1
+elif [ "$installed" != "$tag" ]; then
+  fail 'release identities conflict at the same workflow run and attempt'
+fi
+
+if [ "$json_mode" = 1 ] && [ "$history_only" = 0 ]; then
+  JSON_PREFIX=${JSON_PREFIX:-}
+  set +u
+  . /usr/share/libubox/jshn.sh
+  json_init
+  json_add_string current "$installed"
+  json_add_string current_published_at ""
+  json_add_string latest "$tag"
+  json_add_string latest_published_at ""
+  json_add_boolean checked 1
+  json_add_boolean update_available "$update_available"
+  json_add_boolean installed_newer "$installed_newer"
+  json_add_boolean history_complete 0
+  json_add_array releases
+  json_add_object ""
+  json_add_string tag "$tag"
+  json_add_string published_at ""
+  json_add_array changes
+  descriptor_file="$temporary/release.json"
+  jsonfilter -i "$descriptor_file" -e '@.changelog[*]' > "$temporary/changes" 2>/dev/null || true
+  change_count=0
+  while IFS= read -r change; do
+    change_count=$((change_count + 1))
+    [ "$change_count" -le 12 ] || break
+    json_add_string "" "$change"
+  done < "$temporary/changes"
+  json_close_array
+  json_close_object
+  json_close_array
+  json_dump
+  set -u
+  exit 0
+fi
+
+if [ "$history_only" = 1 ]; then
+  history_complete=1
+  current_published_at=
+  latest_published_at=
+  seen_latest=0
+  : > "$temporary/history"
+  # Discovery used to fetch /releases?per_page=5 from the API.  That answer is
+  # 1.6 MB, because GitHub embeds full metadata for all 189 assets of every
+  # release, and jsonfilter then re-parsed the whole document once per field --
+  # fifteen parses, measured at seven seconds of the fifteen-second budget.  That
+  # starved the descriptor downloads this step exists to feed, so the last
+  # entries were dropped and the history reported itself incomplete.  The
+  # releases feed carries the tag as <title> and the publication time as
+  # <updated> in 25 KB, and one awk pass reads both.  Drafts are absent from the
+  # feed, exactly as they are from the unauthenticated API, so an unpromoted
+  # build still cannot appear.  The feed does not mark prereleases and this
+  # project publishes none; a prerelease would now be listed rather than skipped.
+  # Discovery stays untrusted either way -- every descriptor below is still
+  # fetched from its own release URL and verified with usign.
+  if try_download "$repository/releases.atom" "$temporary/releases.atom" &&
+     grep -q '<entry>' "$temporary/releases.atom"; then
+    awk 'BEGIN { RS = "<entry>" }
+         NR > 1 {
+           tag = ""; date = ""
+           if (match($0, "<title>[^<]*</title>"))
+             tag = substr($0, RSTART + 7, RLENGTH - 15)
+           if (match($0, "<updated>[^<]*</updated>"))
+             date = substr($0, RSTART + 9, RLENGTH - 19)
+           if (tag != "" && date != "") {
+             print date "|" tag
+             if (++seen == 5) exit
+           }
+         }' "$temporary/releases.atom" > "$temporary/release-feed"
+    [ -s "$temporary/release-feed" ] || history_complete=0
+    index=0
+    : > "$temporary/release-order"
+    while IFS='|' read -r history_date history_tag; do
+      if ! valid_tag "$history_tag" || ! valid_date "$history_date"; then
+        history_complete=0
+        index=$((index + 1))
+        continue
+      fi
+      printf '%s|%s|%s\n' "$history_date" "$history_tag" "$index" >> "$temporary/release-order"
+      index=$((index + 1))
+    done < "$temporary/release-feed"
+    LC_ALL=C sort -r "$temporary/release-order" > "$temporary/release-order.sorted"
+    : > "$temporary/history-jobs"
+    scheduled=0
+    batch_count=0
+    examined=0
+    while IFS='|' read -r history_date history_tag index; do
+      if [ "$examined" -ge 5 ]; then
+        history_complete=0
+        break
+      fi
+      examined=$((examined + 1))
+      if [ "$history_tag" = "$tag" ]; then
+        latest_published_at=$history_date
+        seen_latest=1
+        [ "$history_tag" != "$installed" ] || current_published_at=$history_date
+        continue
+      fi
+      if [ "$scheduled" -ge 4 ]; then
+        history_complete=0
+        break
+      fi
+      scheduled=$((scheduled + 1))
+      try_download_pair \
+        "$repository/releases/download/$history_tag/release.json" "$temporary/history.$index.json" \
+        "$repository/releases/download/$history_tag/release.json.sig" "$temporary/history.$index.sig" &
+      printf '%s|%s|%s|%s\n' "$!" "$index" "$history_tag" "$history_date" >> "$temporary/history-jobs"
+      batch_count=$((batch_count + 1))
+      if [ "$batch_count" -eq 2 ]; then
+        collect_history_jobs
+        batch_count=0
+      fi
+    done < "$temporary/release-order.sorted"
+    collect_history_jobs
+  else
+    history_complete=0
+  fi
+
+  [ "$seen_latest" = 1 ] || history_complete=0
+
+  JSON_PREFIX=${JSON_PREFIX:-}
+  set +u
+  . /usr/share/libubox/jshn.sh
+  json_init
+  json_add_string current "$installed"
+  json_add_string current_published_at "$current_published_at"
+  json_add_string latest "$tag"
+  json_add_string latest_published_at "$latest_published_at"
+  json_add_boolean checked 1
+  json_add_boolean update_available "$update_available"
+  json_add_boolean installed_newer "$installed_newer"
+  json_add_boolean history_complete "$history_complete"
+  json_add_array releases
+  while IFS='|' read -r history_index history_tag history_date; do
+    [ -n "$history_tag" ] || continue
+    descriptor_file="$temporary/history.$history_index.json"
+    json_add_object ""
+    json_add_string tag "$history_tag"
+    json_add_string published_at "$history_date"
+    json_add_array changes
+    jsonfilter -i "$descriptor_file" -e '@.changelog[*]' > "$temporary/changes" 2>/dev/null || true
+    change_count=0
+    while IFS= read -r change; do
+      change_count=$((change_count + 1))
+      [ "$change_count" -le 12 ] || break
+      json_add_string "" "$change"
+    done < "$temporary/changes"
+    json_close_array
+    json_close_object
+  done < "$temporary/history"
+  json_close_array
+  json_dump
+  set -u
+  exit 0
+fi
+
+echo "Installed Release: ${installed:-unknown}"
+echo "Latest Release:    $tag"
+if [ "$installed_newer" = 1 ] && [ "$force" = 0 ]; then
+  fail 'the installed build is newer than the latest public Release; use --force only if replacement is intentional'
+fi
+
+if [ "$installed" = "$tag" ] && [ "$force" = 0 ] && [ "$check_only" = 0 ]; then
+  echo 'The latest Release is already installed.'
+  job_state failed 'the latest Release is already installed'
+  exit 0
+fi
+
+echo 'Downloading the immutable sysupgrade image...'
+job_state downloading
+download_image "$image_url/$asset" "$temporary/$asset"
+actual=$(sha256sum "$temporary/$asset" | awk '{ print $1 }')
+[ "$actual" = "$checksum" ] || fail 'downloaded image SHA-256 mismatch'
+job_state verifying
+sysupgrade -T "$temporary/$asset" >/dev/null 2>&1 ||
+  fail 'sysupgrade rejected the downloaded image'
+
+echo "Verified SHA-256:  $checksum"
+echo 'Image compatibility check passed.'
+[ "$check_only" = 0 ] || exit 0
+
+echo
+echo 'WARNING: The router will be unavailable while the firmware is installed.'
+echo 'The complete upgrade and boot can take approximately 5-7 minutes.'
+if [ "$keep_config" = 0 ]; then
+  echo 'WARNING: -n was selected; current configuration will not be preserved.'
+fi
+if [ "$assume_yes" = 0 ]; then
+  while :; do
+    printf 'Continue with the firmware upgrade? [y/n] '
+    IFS= read -r answer || answer=n
+    case "$answer" in
+      y|Y) break ;;
+      n|N) echo 'Upgrade cancelled.'; exit 0 ;;
+      *) echo 'Please enter y or n.' ;;
+    esac
+  done
+fi
+
+echo 'Starting sysupgrade. Do not disconnect power during the upgrade.'
+job_state flashing
+if [ "$keep_config" = 1 ]; then
+  exec sysupgrade -v "$temporary/$asset"
+else
+  exec sysupgrade -n -v "$temporary/$asset"
+fi

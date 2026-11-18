@@ -4,9 +4,7 @@ hh71vm-openwrt-flash-bundle/
 *.sha256
 *.bin
 
-# Cloned upstream source repositories (managed separately)
-hh71vm-openwrt/
-unifi-openwrt/
+# Toolchains
 .tools/
 
 # Device-unique backups and local environment secrets

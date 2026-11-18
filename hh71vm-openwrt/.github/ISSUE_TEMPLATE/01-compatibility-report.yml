@@ -1,0 +1,124 @@
+name: Hardware compatibility report
+description: Tell us whether this firmware worked on your router
+title: "[Compatibility] "
+labels: ["hardware"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        This port was developed on one physical HH71VM. Other board revisions, regions and carrier variants are unverified, so a report saying "it just worked" is as useful as one saying it did not.
+
+        The dropdowns are the important part and take a minute. Everything else is optional.
+
+        If you paste logs, redact what you do not want public: full MAC addresses, serial numbers, IMEI/IMSI, phone numbers and message text.
+
+  - type: dropdown
+    id: install-path
+    attributes:
+      label: How did you run it
+      options:
+        - Installed into flash
+        - RAM dry run over UART
+    validations:
+      required: true
+
+  - type: dropdown
+    id: outcome
+    attributes:
+      label: Overall result
+      options:
+        - Booted and worked as documented
+        - Booted, but something behaved differently
+        - Failed before OpenWrt finished booting
+        - OpenWrt booted but networking failed
+    validations:
+      required: true
+
+  - type: dropdown
+    id: ethernet
+    attributes:
+      label: Ethernet
+      options:
+        - Worked
+        - Partly worked
+        - Did not work
+        - Not tested
+    validations:
+      required: true
+
+  - type: dropdown
+    id: wifi-24
+    attributes:
+      label: 2.4 GHz Wi-Fi
+      options:
+        - Worked
+        - Partly worked
+        - Did not work
+        - Not tested
+    validations:
+      required: true
+
+  - type: dropdown
+    id: wifi-5
+    attributes:
+      label: 5 GHz Wi-Fi
+      options:
+        - Worked
+        - Partly worked
+        - Did not work
+        - Not tested
+    validations:
+      required: true
+
+  - type: dropdown
+    id: modem
+    attributes:
+      label: Mobile Internet through the modem
+      options:
+        - Worked
+        - Partly worked
+        - Did not work
+        - Not tested
+    validations:
+      required: true
+
+  - type: input
+    id: model
+    attributes:
+      label: Exact router model and region
+      description: As printed on the label. Not the serial number.
+      placeholder: Alcatel LINKHUB HH71VM, unbranded, Poland
+    validations:
+      required: true
+
+  - type: input
+    id: stock-version
+    attributes:
+      label: Stock firmware version it came with
+      description: If you noted it before installing. Leave blank if you did not.
+    validations:
+      required: false
+
+  - type: input
+    id: release
+    attributes:
+      label: Which release did you install
+      description: "The tag, or the output of `cat /usr/share/hh71vm-feed/release.conf` on the router."
+    validations:
+      required: false
+
+  - type: input
+    id: board-revision
+    attributes:
+      label: Visible PCB markings
+      description: Only if you opened the case. Not a serial number.
+    validations:
+      required: false
+
+  - type: textarea
+    id: notes
+    attributes:
+      label: What was different, and anything from the log
+      description: What you expected, what happened, and where it stopped. Installer output or `logread` if you have it.
+    validations:
+      required: false

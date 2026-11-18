@@ -1,0 +1,118 @@
+#!/usr/bin/lua
+-- SPDX-License-Identifier: Apache-2.0
+package.path='/usr/libexec/modem-extra-tools/?.lua;/usr/libexec/hh71vm-simlock/?.lua;' .. package.path
+local c, json = require 'common', require 'luci.jsonc'
+local arguments, json_output, imei_confirmation={},false,false
+local simlock_confirmation, simlock_erase_confirmation, expected_state=false,false,nil
+local simlock_lock_confirmation=false
+local want_state=false
+for _,value in ipairs(arg) do
+  if want_state then expected_state=value; want_state=false
+  elseif value=='--json' then json_output=true
+  elseif value=='--confirm-original-imei' then imei_confirmation=true
+  -- A separate flag from the IMEI one on purpose: these confirm different risks.
+  elseif value=='--confirm-sim-unlock' then simlock_confirmation=true
+  elseif value=='--confirm-sim-erase' then simlock_erase_confirmation=true
+  elseif value=='--confirm-sim-lock' then simlock_lock_confirmation=true
+  elseif value=='--expected-state' then want_state=true
+  else arguments[#arguments+1]=value end
+end
+local function main()
+  local command,sub=arguments[1],arguments[2]
+  if command=='status' then
+    -- Cached only. This runs often; SIM lock state is an explicit read because it costs
+    -- a round trip to core_app.
+    return {ok=true,ttl=require('ttl').status(),bands=require('bands').cached(),
+      imei=require('imei').cached(),simlock=require('simlock').cached()}
+  elseif command=='ttl' or command=='firewall' then
+    local t=require 'ttl'
+    if command=='ttl' and (not sub or sub=='show') then return t.status() end
+    local lock=c.lock('ttl'); local state=t.config()
+    local ok,result=pcall(function()
+      if command=='firewall' then
+        c.need(not sub or sub=='disable','unexpected firewall argument')
+        if sub=='disable' then state.enabled=false end
+        -- Deferrable: fw3 runs this include at boot, long before the Qualcomm side has
+        -- enumerated its RNDIS gadget, and again on every later reload whenever one
+        -- happens to land. A WAN with no L3 device yet is not a failure here.
+        local applied,why=t.apply(state,true)
+        return {ok=true,applied=applied and true or false,
+          deferred=(not applied) or nil,reason=why}
+      end
+      if sub=='reconcile' then
+        c.need(#arguments==2,'usage: ttl reconcile'); return t.reconcile()
+      end
+      if sub=='disable' then
+        c.need(#arguments==2,'usage: ttl disable'); state.enabled=false
+      elseif sub=='set' then
+        c.need(#arguments>=3 and #arguments<=5,'usage: ttl set IPV4 [IPV6|off] [WAN_NETWORK]')
+        state.enabled=true; state.ipv4_value=c.uint(arguments[3],1,255,'IPv4 TTL')
+        state.ipv6_enabled=arguments[4]~=nil and arguments[4]~='off'
+        if state.ipv6_enabled then state.ipv6_value=c.uint(arguments[4],1,255,'IPv6 Hop Limit') end
+        state.wan_network=arguments[5] or state.wan_network
+      else error('unknown TTL command',0) end
+      return t.change(state)
+    end)
+    lock:close(); c.need(ok,result); return result
+  elseif command=='bands' then
+    local allowed={show=true,backup=true,set=true,restore=true,undo=true,recover=true,reconcile=true}
+    sub=sub or 'show'; c.need(allowed[sub],'unknown band command')
+    local text
+    if sub=='set' then
+      c.need(arguments[3],'usage: bands set 3,7')
+      text=arguments[3]
+      c.need(#arguments==3,'unexpected band argument (QMI applies without a reboot)')
+    else
+      c.need(#arguments<=2,'unexpected band argument (QMI applies without a reboot)')
+    end
+    return require('bands').execute(sub,text)
+  elseif command=='imei' then
+    sub=sub or 'show'
+    c.need(sub=='show' or sub=='restore' or sub=='recover','unknown IMEI command')
+    if sub=='restore' then
+      c.need(#arguments==3,'usage: imei restore 15_DIGIT_ORIGINAL_IMEI --confirm-original-imei')
+      return require('imei').execute('restore',arguments[3],imei_confirmation)
+    end
+    c.need(#arguments<=2 and not imei_confirmation,'unexpected IMEI argument')
+    return require('imei').execute(sub)
+  elseif command=='simlock' then
+    sub=sub or 'status'
+    local s=require 'simlock'
+    c.need(sub=='status' or sub=='imei' or sub=='nck' or sub=='unlock' or sub=='erase'
+      or sub=='lock','unknown SIM lock command')
+    if sub=='status' or sub=='imei' or sub=='nck' then
+      c.need(#arguments<=2 and not simlock_confirmation and not simlock_erase_confirmation
+        and not simlock_lock_confirmation and not expected_state,'unexpected SIM lock argument')
+      if sub=='status' then return s.inspect() end
+      if sub=='imei' then return s.live_imei() end
+      return s.generate(c.need(io.read('*l'),'enter a 15-digit IMEI on stdin'))
+    end
+    if sub=='erase' then
+      c.need(#arguments==2 and not simlock_confirmation and not simlock_lock_confirmation
+        and not expected_state,'unexpected SIM lock argument')
+      return s.erase(simlock_erase_confirmation)
+    end
+    if sub=='lock' then
+      c.need(#arguments==3 and not simlock_confirmation and not simlock_erase_confirmation
+        and not expected_state,'usage: simlock lock PLMN --confirm-sim-lock')
+      return s.lock(arguments[3],simlock_lock_confirmation)
+    end
+    c.need(expected_state,'--expected-state is required: read simlock status first')
+    -- The state is signed (-1 means no personalisation), so uint() does not fit here.
+    c.need(tostring(expected_state):match('^%-?%d+$'),'--expected-state: integer required')
+    c.need(#arguments<=3 and not simlock_erase_confirmation and not simlock_lock_confirmation,
+      'unexpected SIM lock argument')
+    local code=arguments[3] or c.need(io.read('*l'),'enter an NCK on stdin')
+    return s.unlock(code,tonumber(expected_state),simlock_confirmation)
+  end
+  error('Usage:\n  modem-extra-tools status [--json]\n  modem-extra-tools simlock status|imei\n  modem-extra-tools simlock nck                    (read IMEI from stdin)\n  modem-extra-tools simlock unlock [NCK] --expected-state N --confirm-sim-unlock\n  modem-extra-tools simlock erase --confirm-sim-erase          (unlock without a code)\n  modem-extra-tools simlock lock PLMN --confirm-sim-lock       (lock to that network)\n  modem-extra-tools ttl show|disable|reconcile\n  modem-extra-tools ttl set IPV4 [IPV6|off] [MOBILE_WAN_NETWORK]\n  modem-extra-tools bands show|backup\n  modem-extra-tools bands set 3,7\n  modem-extra-tools bands restore|undo|recover\n  modem-extra-tools imei show|recover\n  modem-extra-tools imei restore 15_DIGIT_ORIGINAL_IMEI --confirm-original-imei',0)
+end
+local ok,result=pcall(main)
+if not ok then result={ok=false,error=tostring(result)} end
+if json_output then print(json.stringify(result))
+elseif not ok then io.stderr:write(result.error,'\n')
+else
+  -- Same schema in terminal and RPC. Pretty JSON is unambiguous and scriptable.
+  print(json.stringify(result,true))
+end
+os.exit(ok and 0 or 1)

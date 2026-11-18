@@ -1,0 +1,7 @@
+{
+  "schema": 1,
+  "changes": [
+    "Added modules and packages: kmod-nft-queue, ip6tables-mod-nat and ip6tables-extra.",
+    "Added dependencies: kmod-nft-core, kmod-nf-nat6, kmod-ipt-nat6 and kmod-ip6tables-extra."
+  ]
+}

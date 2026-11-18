@@ -1,0 +1,68 @@
+name: Bug report
+description: Report something that does not work
+title: "[Bug] "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Please check [known issues](https://github.com/sowarden/hh71vm-openwrt/blob/main/docs/known-issues.md) first.
+
+        Only the first two fields are required. Fill in the rest if you can — it makes the report much easier to act on.
+
+        Review anything you paste and redact what you do not want public: full MAC addresses, serial numbers, IMEI/IMSI, phone numbers, message text, passwords and keys.
+
+  - type: textarea
+    id: summary
+    attributes:
+      label: What happens
+      description: What went wrong, and what did you expect instead?
+    validations:
+      required: true
+
+  - type: textarea
+    id: steps
+    attributes:
+      label: How to reproduce it
+      description: If you cannot reproduce it on purpose, say so and describe what you were doing when it happened.
+      placeholder: |
+        1.
+        2.
+        3.
+
+        Or: cannot reproduce on purpose — it happened while ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: version
+    attributes:
+      label: Firmware and kernel version
+      description: |
+        Run this on the router over SSH and paste the output:
+
+        ```
+        ubus call system board
+        cat /etc/openwrt_release
+        ```
+      render: text
+    validations:
+      required: false
+
+  - type: input
+    id: model
+    attributes:
+      label: Exact router model
+      description: As printed on the label. Not the serial number.
+      placeholder: Alcatel LINKHUB HH71VM
+    validations:
+      required: false
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Anything from the log
+      description: "`logread` and `dmesg` on the router. Include the lines around the failure, not only the last one."
+      render: text
+    validations:
+      required: false

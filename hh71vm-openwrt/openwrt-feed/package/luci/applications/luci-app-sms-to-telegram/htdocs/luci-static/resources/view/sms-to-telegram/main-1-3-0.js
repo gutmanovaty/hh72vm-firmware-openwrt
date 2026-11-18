@@ -1,0 +1,456 @@
+'use strict';
+// SPDX-License-Identifier: Apache-2.0
+'require view';
+'require rpc';
+'require ui';
+'require dom';
+
+var statusCall = rpc.declare({ object: 'sms-to-telegram', method: 'status' });
+var configGet = rpc.declare({ object: 'sms-to-telegram', method: 'config_get' });
+var configSet = rpc.declare({ object: 'sms-to-telegram', method: 'config_set',
+	params: [ 'token', 'chat_id', 'template', 'parse_mode', 'remove_after_send',
+		'proxy_type', 'proxy_host', 'proxy_port', 'proxy_username', 'proxy_password',
+		'clear_proxy_password' ] });
+
+/* What each %name% stands for.  The names themselves come from the backend, so the two
+   cannot drift apart; only the wording lives here. */
+var PLACEHOLDER_HELP = {
+	sender: _('Who sent the message: the number, or the name a service used.'),
+	receiver: _('This router\'s own SIM number, when the network reports one.'),
+	sms_text: _('The message text. The parts of a long SMS are already joined.'),
+	receive_time: _('When the message was sent, as the message itself records it.'),
+	router_time: _('The router\'s own clock at the moment it forwarded the message.'),
+	parts: _('How many parts a long SMS arrived in; 1 for an ordinary message.'),
+	incomplete: _('A note naming the missing parts. Empty when the message is whole.'),
+	storage: _('Which SIM store the message came from: ME or SM.'),
+	hostname: _('This router\'s hostname, useful when several routers share one chat.')
+};
+
+var PARSE_MODE_LABEL = {
+	HTML: _('HTML \u2014 recommended'),
+	MarkdownV2: _('MarkdownV2'),
+	none: _('Plain text \u2014 no formatting')
+};
+var discoverChat = rpc.declare({ object: 'sms-to-telegram', method: 'discover_chat',
+	params: [ 'token', 'proxy_type', 'proxy_host', 'proxy_port', 'proxy_username',
+		'proxy_password', 'clear_proxy_password' ] });
+
+function checked(result) {
+	if (!result || result.ok !== true) {
+		var error = new Error(result && result.error || 'invalid_response');
+		error.retryAfter = result && result.retry_after;
+		throw error;
+	}
+	return result;
+}
+
+function message(code, retryAfter) {
+	var messages = {
+		invalid_token: _('The bot token is invalid. Copy the complete token from BotFather and try again.'),
+		invalid_chat_id: _('Enter a positive numeric Telegram private chat ID. Usernames, links, spaces, zero and negative values are not accepted.'),
+		invalid_proxy_type: _('Select Disabled, HTTP or SOCKS5 for the Telegram proxy.'),
+		invalid_proxy_host: _('Enter a valid proxy hostname or IP address without a URL scheme, path or spaces.'),
+		invalid_proxy_port: _('Enter a proxy port from 1 to 65535.'),
+		invalid_proxy_credentials: _('Proxy credentials must not contain control characters and may be at most 256 characters each.'),
+		invalid_template: _('The message template must contain some text, must be at most 2000 characters, and must not contain control characters.'),
+		invalid_parse_mode: _('Select HTML, MarkdownV2 or plain text for the message formatting.'),
+		no_private_chat: _('No recent private chats were found. Send your bot a new private message, then try detection again.'),
+		too_many_private_chats: _('Too many private chats were returned. Send the bot a fresh message from the intended account and try again later.'),
+		telegram_rate_limited: retryAfter ?
+			_('Telegram asked this router to wait %d seconds. Try again after that delay.').format(retryAfter) :
+			_('Telegram rate-limited this request. Wait briefly, then try again.'),
+		telegram_http_error: _('Telegram returned an HTTP error. Check the token and try again later.'),
+		telegram_api_error: _('Telegram rejected the request. Check the token and try again.'),
+		telegram_transport_failed: _('The router could not reach Telegram. Check internet access, and check that the clock is correct — this board has no battery-backed clock, and a wrong date makes the secure connection fail.'),
+		telegram_invalid_response: _('Telegram returned data that could not be handled safely. Send a fresh private message and try again.'),
+		config_write_failed: _('The configuration could not be saved.'),
+		modem_unavailable: _('The modem SMS service is temporarily unavailable.'),
+		sim_delete_failed: _('A delivered SMS is waiting for another SIM deletion attempt.'),
+		sim_delete_unconfirmed: _('SIM deletion could not be confirmed and will be retried safely.'),
+		internal_error: _('The service encountered an internal error. Its delivery state was preserved.')
+	};
+	return messages[code] || _('The operation failed safely.');
+}
+
+function notify(error) {
+	ui.addNotification(null, E('p', {}, [ message(String(error && (error.message || error.error) || error),
+		error && error.retryAfter) ]), 'error');
+}
+
+function field(label, input, description) {
+	return E('div', { 'class': 'cbi-value' }, [
+		E('div', { 'class': 'cbi-value-title' }, [ label ]),
+		E('div', { 'class': 'cbi-value-field' }, [
+			input,
+			E('div', { 'class': 'cbi-value-description' }, description != null ? [ description ] : [])
+		])
+	]);
+}
+
+function step(number, title, children) {
+	return E('section', { 'class': 'cbi-section', 'style': 'margin-bottom:1em' }, [
+		E('h3', { 'style': 'margin-top:0' }, _('Step %d — %s').format(number, title))
+	].concat(children));
+}
+
+function statusPill(text, good) {
+	return E('span', {
+		'class': good ? 'label success' : 'label warning',
+		'style': 'display:inline-block;margin:0 .5em .35em 0'
+	}, [ text ]);
+}
+
+function candidateLabel(candidate) {
+	var parts = [ E('strong', {}, _('Chat ID: %s').format(candidate.chat_id)) ];
+	if (candidate.username) {
+		parts.push(document.createTextNode(' — '));
+		parts.push(E('bdi', { 'dir': 'auto' }, document.createTextNode('@' + candidate.username)));
+	}
+	else {
+		var names = [];
+		if (candidate.first_name) names.push(candidate.first_name);
+		if (candidate.last_name) names.push(candidate.last_name);
+		if (names.length) {
+			parts.push(document.createTextNode(' — '));
+			parts.push(E('bdi', { 'dir': 'auto' }, document.createTextNode(names.join(' '))));
+		}
+	}
+	return parts;
+}
+
+return view.extend({
+	load: function() {
+		return Promise.all([ statusCall(), configGet() ]);
+	},
+
+	validate: function() {
+		var token = this.form.token.value;
+		var chat = this.form.chat.value;
+		var proxyType = this.form.proxyType.value;
+		var proxyHost = this.form.proxyHost.value.trim();
+		var proxyPort = Number(this.form.proxyPort.value);
+		if (token && !/^[1-9][0-9]+:[A-Za-z0-9_-]+$/.test(token))
+			throw new Error('invalid_token');
+		if (chat && !/^[1-9][0-9]{4,19}$/.test(chat))
+			throw new Error('invalid_chat_id');
+		if ([ 'none', 'http', 'socks5' ].indexOf(proxyType) < 0)
+			throw new Error('invalid_proxy_type');
+		var template = this.form.template.value;
+		if (!/\S/.test(template) || template.length > 2000 ||
+		    /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/.test(template))
+			throw new Error('invalid_template');
+		if ([ 'none', 'HTML', 'MarkdownV2' ].indexOf(this.form.parseMode.value) < 0)
+			throw new Error('invalid_parse_mode');
+		if (proxyHost && !/^[A-Za-z0-9_.:%-]{1,253}$/.test(proxyHost))
+			throw new Error('invalid_proxy_host');
+		if (proxyType !== 'none' && !proxyHost)
+			throw new Error('invalid_proxy_host');
+		if (!Number.isInteger(proxyPort) || proxyPort < 1 || proxyPort > 65535)
+			throw new Error('invalid_proxy_port');
+		[ this.form.proxyUsername.value, this.form.proxyPassword.value ].forEach(function(value) {
+			if (value.length > 256 || /[\u0000-\u001f\u007f]/.test(value))
+				throw new Error('invalid_proxy_credentials');
+		});
+	},
+
+	setBusy: function(value) {
+		this.busy = value;
+		if (this.form && this.form.detect) this.form.detect.disabled = value;
+	},
+
+	updateProxyState: function() {
+		if (!this.form) return;
+		var enabled = this.form.proxyType.value !== 'none';
+		[ this.form.proxyHost, this.form.proxyPort, this.form.proxyUsername,
+			this.form.proxyPassword, this.form.clearProxyPassword ].forEach(function(input) {
+			input.disabled = !enabled;
+		});
+		this.form.proxyFields.style.opacity = enabled ? '1' : '.58';
+	},
+
+	drawStatus: function(state) {
+		var children = [
+			statusPill(state.configured ? _('Configured') : _('Not configured'), state.configured),
+			statusPill(state.running ? _('Running') : _('Stopped'), state.running),
+			statusPill(_('Pending: %d').format(state.pending || 0), (state.pending || 0) === 0),
+			statusPill(_('Pending SIM deletion: %d').format(state.pending_delete || 0), (state.pending_delete || 0) === 0)
+		];
+		if (state.template_rejected)
+			children.push(E('div', { 'class': 'alert-message warning' }, [
+				_('Telegram would not accept the template\'s formatting, so the last message was sent as plain text. Check the markup below, or select plain text.')
+			]));
+		if (state.last_error)
+			children.push(E('div', { 'class': 'cbi-value-description' }, [
+				E('strong', {}, _('Last issue: ')), message(String(state.last_error))
+			]));
+		return children;
+	},
+
+	handleSave: null,
+
+	saveConfiguration: function() {
+		var self = this;
+		if (!this.form || this.busy) return Promise.resolve();
+		try { this.validate(); } catch (error) { notify(error); return Promise.resolve(); }
+		this.setBusy(true);
+		return configSet(this.form.token.value, this.form.chat.value,
+			this.form.template.value, this.form.parseMode.value, this.form.remove.checked,
+			this.form.proxyType.value, this.form.proxyHost.value.trim(), this.form.proxyPort.value,
+			this.form.proxyUsername.value, this.form.proxyPassword.value,
+			this.form.clearProxyPassword.checked)
+			.then(checked)
+			.then(function() {
+				self.form.token.value = '';
+				self.form.proxyPassword.value = '';
+				self.form.clearProxyPassword.checked = false;
+				ui.addNotification(null, E('p', {}, _('SMS to Telegram settings were saved. The service will use them on its next polling cycle.')), 'info');
+				return Promise.all([ statusCall(), configGet() ]);
+			})
+			.then(function(values) {
+				var state = checked(values[0]);
+				var config = checked(values[1]);
+				self.form.token.placeholder = config.token_set ?
+					_('Configured — leave blank to keep the current token') : _('Paste the bot token');
+				self.form.proxyPassword.placeholder = config.proxy_password_set ?
+					_('Configured — leave blank to keep the current password') : _('Optional password');
+				dom.content(self.form.status, self.drawStatus(state));
+				return state;
+			})
+			.catch(function(error) { notify(error); })
+			.then(function(value) { self.setBusy(false); return value; });
+	},
+
+	handleSaveApply: function() {
+		return this.saveConfiguration();
+	},
+
+	handleReset: function() {
+		var self = this;
+		if (!this.form || this.busy) return Promise.resolve();
+		this.setBusy(true);
+		return Promise.all([ statusCall(), configGet() ]).then(function(values) {
+			var state = checked(values[0]);
+			var config = checked(values[1]);
+			self.form.token.value = '';
+			self.form.token.placeholder = config.token_set ?
+				_('Configured — leave blank to keep the current token') : _('Paste the bot token');
+			self.form.chat.value = config.chat_id || '';
+			self.form.template.value = config.template || config.default_template || '';
+			self.form.parseMode.value = config.parse_mode || 'HTML';
+			self.form.remove.checked = config.remove_after_send === true;
+			self.form.proxyType.value = config.proxy_type || 'none';
+			self.form.proxyHost.value = config.proxy_host || '';
+			self.form.proxyPort.value = config.proxy_port || '8080';
+			self.form.proxyUsername.value = config.proxy_username || '';
+			self.form.proxyPassword.value = '';
+			self.form.proxyPassword.placeholder = config.proxy_password_set ?
+				_('Configured — leave blank to keep the current password') : _('Optional password');
+			self.form.clearProxyPassword.checked = false;
+			self.updateProxyState();
+			dom.content(self.form.candidates, '');
+			dom.content(self.form.status, self.drawStatus(state));
+		}).catch(notify).then(function() { self.setBusy(false); });
+	},
+
+	render: function(data) {
+		var self = this;
+		var state = checked(data[0]);
+		var config = checked(data[1]);
+		var body = E('div');
+		var token = E('input', {
+			'type': 'password',
+			'autocomplete': 'new-password',
+			'value': '',
+			'placeholder': config.token_set ? _('Configured — leave blank to keep the current token') : _('Paste the bot token'),
+			'style': 'width:32em;max-width:100%',
+			'aria-label': _('Telegram Bot Token')
+		});
+		var chat = E('input', {
+			'type': 'text',
+			'inputmode': 'numeric',
+			'pattern': '[0-9]+',
+			'maxlength': 20,
+			'value': config.chat_id || '',
+			'style': 'width:22em;max-width:100%',
+			'aria-label': _('Destination Chat ID')
+		});
+		var proxyType = E('select', {
+			'change': function() { self.updateProxyState(); },
+			'aria-label': _('Proxy type')
+		}, [
+			E('option', { 'value': 'none', 'selected': config.proxy_type === 'none' ? 'selected' : null }, _('Disabled')),
+			E('option', { 'value': 'http', 'selected': config.proxy_type === 'http' ? 'selected' : null }, _('HTTP')),
+			E('option', { 'value': 'socks5', 'selected': config.proxy_type === 'socks5' ? 'selected' : null }, _('SOCKS5 (remote DNS)'))
+		]);
+		var proxyHost = E('input', {
+			'type': 'text', 'maxlength': 253, 'value': config.proxy_host || '',
+			'placeholder': _('Proxy hostname or IP address'), 'style': 'width:22em;max-width:100%',
+			'aria-label': _('Proxy host')
+		});
+		var proxyPort = E('input', {
+			'type': 'number', 'min': 1, 'max': 65535, 'value': config.proxy_port || '8080',
+			'style': 'width:9em;max-width:100%', 'aria-label': _('Proxy port')
+		});
+		var proxyUsername = E('input', {
+			'type': 'text', 'maxlength': 256, 'value': config.proxy_username || '',
+			'autocomplete': 'off', 'style': 'width:22em;max-width:100%',
+			'placeholder': _('Optional username'), 'aria-label': _('Proxy username')
+		});
+		var clearProxyPassword = E('input', { 'type': 'checkbox' });
+		var proxyPassword = E('input', {
+			'type': 'password', 'maxlength': 256, 'value': '', 'autocomplete': 'new-password',
+			'style': 'width:22em;max-width:100%',
+			'placeholder': config.proxy_password_set ?
+				_('Configured — leave blank to keep the current password') : _('Optional password'),
+			'aria-label': _('Proxy password'),
+			'input': function() {
+				if (proxyPassword.value) clearProxyPassword.checked = false;
+			}
+		});
+		var proxyFields = E('div', {}, [
+			field(_('Proxy host'), proxyHost, _('Hostname or IP address only; do not include http://, socks5:// or a path.')),
+			field(_('Proxy port'), proxyPort, _('The TCP port exposed by the proxy server.')),
+			field(_('Proxy username'), proxyUsername, _('Optional. Used only when authenticating this package to the configured proxy.')),
+			field(_('Proxy password'), proxyPassword,
+				_('Leave blank to keep the saved password. The saved value is never shown.')),
+			field(_('Stored proxy password'), E('label', {}, [ clearProxyPassword, ' ',
+				_('Clear the saved proxy password') ]),
+				_('Select this only when the proxy no longer requires the stored password.'))
+		]);
+		var defaultTemplate = config.default_template || '';
+		var template = E('textarea', {
+			'rows': 8,
+			'spellcheck': 'false',
+			'style': 'width:42em;max-width:100%;font-family:monospace;overflow-wrap:anywhere',
+			'aria-label': _('Message template')
+		}, [ config.template || defaultTemplate ]);
+		var parseMode = E('select', { 'aria-label': _('Telegram formatting') },
+			[ 'HTML', 'MarkdownV2', 'none' ].map(function(mode) {
+				return E('option', {
+					'value': mode,
+					'selected': (config.parse_mode || 'HTML') === mode ? 'selected' : null
+				}, [ PARSE_MODE_LABEL[mode] ]);
+			}));
+		var restoreTemplate = E('button', {
+			'class': 'cbi-button', 'type': 'button',
+			'click': function() { template.value = defaultTemplate; }
+		}, [ _('Restore the default template') ]);
+		var placeholderRows = (config.placeholders || Object.keys(PLACEHOLDER_HELP))
+			.map(function(name) {
+				return E('tr', {}, [
+					E('td', { 'style': 'white-space:nowrap;padding-right:1em' },
+						[ E('code', {}, [ '%' + name + '%' ]) ]),
+					E('td', {}, [ PLACEHOLDER_HELP[name] || '' ])
+				]);
+			});
+		var remove = E('input', { 'type': 'checkbox', 'checked': config.remove_after_send ? 'checked' : null });
+		var candidates = E('div', { 'style': 'margin-top:.75em' });
+		var status = E('div', { 'class': 'alert-message', 'style': 'margin-bottom:1em' }, this.drawStatus(state));
+		var detect = E('button', {
+			'class': 'cbi-button cbi-button-action',
+			'type': 'button',
+			'click': function() {
+				if (self.busy) return;
+				self.setBusy(true);
+				dom.content(candidates, E('p', {}, _('Checking recent Telegram updates…')));
+				discoverChat(token.value, proxyType.value, proxyHost.value.trim(), proxyPort.value,
+					proxyUsername.value, proxyPassword.value, clearProxyPassword.checked)
+					.then(checked).then(function(result) {
+					var radios = [];
+					result.candidates.forEach(function(candidate) {
+						var radio = E('input', {
+							'type': 'radio',
+							'name': 'sms-to-telegram-recipient',
+							'value': candidate.chat_id,
+							'change': function() { if (radio.checked) chat.value = candidate.chat_id; }
+						});
+						radios.push(E('label', {
+							'style': 'display:flex;align-items:flex-start;gap:.55em;padding:.45em 0;overflow-wrap:anywhere'
+						}, [ radio, E('span', {}, candidateLabel(candidate)) ]));
+					});
+					dom.content(candidates, [
+						E('p', {}, result.candidates.length === 1 ?
+							_('One recent private chat was found. Select it below.') :
+							_('%d recent private chats were found. Select the intended recipient.').format(result.candidates.length)),
+						E('div', { 'class': 'cbi-value-description' }, radios)
+					]);
+				}).catch(function(error) {
+					dom.content(candidates, '');
+					notify(error);
+				}).then(function() { self.setBusy(false); });
+			}
+		}, _('Detect Chat IDs'));
+
+		this.busy = false;
+		this.form = { token: token, chat: chat, template: template, parseMode: parseMode,
+			remove: remove, candidates: candidates,
+			status: status, detect: detect, proxyType: proxyType, proxyHost: proxyHost,
+			proxyPort: proxyPort, proxyUsername: proxyUsername, proxyPassword: proxyPassword,
+			clearProxyPassword: clearProxyPassword, proxyFields: proxyFields };
+		this.updateProxyState();
+
+		dom.content(body, [
+			E('h2', {}, _('SMS to Telegram')),
+			E('p', {}, _('Forward SMS messages received by this router to one private Telegram chat. Complete the eight short steps below.')),
+			status,
+			step(1, _('Create a Telegram bot'), [
+				E('ol', {}, [
+					E('li', {}, [ _('Open Telegram and start a chat with '), E('strong', {}, '@BotFather'), '.' ]),
+					E('li', {}, _('Create a bot and copy its bot token.')),
+					E('li', {}, _('Paste the token below.'))
+				]),
+				field(_('Telegram Bot Token'), token,
+					_('Leave this field blank to keep the currently configured token. The saved token is never shown on this page.'))
+			]),
+			step(2, _('Optional Telegram proxy'), [
+				E('p', {}, _('Use this only when the router cannot reach the Telegram Bot API directly. The proxy applies exclusively to Telegram API requests made by this package; it does not change routing for the router, clients or other services.')),
+				field(_('Proxy type'), proxyType,
+					_('HTTP uses an HTTPS CONNECT tunnel. SOCKS5 resolves the Telegram hostname through the proxy.')),
+				proxyFields
+			]),
+			step(3, _('Message the bot'), [
+				E('p', { 'class': 'alert-message warning' }, [
+					E('strong', {}, _('Telegram bots cannot start a private conversation. ')),
+					_('Open your new bot and send it any fresh message immediately before detection.')
+				]),
+				E('p', {}, _('Then select Detect Chat IDs. If the token above has not been saved yet, it is used only for this detection request. A blank field uses the saved token.')),
+				detect
+			]),
+			step(4, _('Select a detected recipient'), [
+				E('p', {}, _('Only private chats from the currently available Telegram updates are shown. Groups and channels are excluded. Detection is not a permanent address book and updates may already have been consumed.')),
+				candidates
+			]),
+			step(5, _('Confirm or edit the recipient'), [
+				field(_('Destination Chat ID'), chat,
+					_('A positive numeric Telegram private chat ID. A normal @username, URL, zero or negative value cannot be used.'))
+			]),
+			step(6, _('Message format'), [
+				E('p', {}, _('Choose what a forwarded message looks like. Everything you type is sent as it is; only the values put in its place are escaped, so a message containing < or * cannot break the formatting or forge any of it.')),
+				field(_('Telegram formatting'), parseMode,
+					_('HTML understands <b>, <i>, <u>, <s>, <code>, <pre>, <a href> and <tg-spoiler>. MarkdownV2 uses *bold*, _italic_, __underline__ and ~strikethrough~. Plain text sends no formatting at all.')),
+				field(_('Message template'), E('div', {}, [ template,
+					E('div', { 'style': 'margin-top:.5em' }, [ restoreTemplate ]) ]),
+					_('Each %name% below is replaced by its value. Anything else is left exactly as typed, so a mistyped name is easy to spot in the result.')),
+				E('details', {}, [
+					E('summary', {}, [ _('Available placeholders') ]),
+					E('table', { 'class': 'table', 'style': 'margin-top:.5em' }, placeholderRows)
+				]),
+				E('p', { 'class': 'cbi-value-description' }, _('If Telegram rejects the formatting, the message is still delivered once as plain text and this page says so, so a mistake in the template never stops messages arriving.'))
+			]),
+			step(7, _('Optional SIM deletion'), [
+				field(_('After successful delivery'), E('label', {}, [ remove, ' ',
+					_('Remove messages from the SIM after successful Telegram delivery') ]),
+					_('An SMS is removed only after Telegram returns HTTP 200 with JSON ok: true. A deletion failure retries deletion without sending the Telegram message again. When disabled, the SMS stays on the SIM and is not forwarded again.'))
+			]),
+			step(8, _('Apply configuration'), [
+				E('p', {}, _('Select Save & Apply below. The service will use the new configuration on its next polling cycle. If the token or destination is missing, forwarding remains not configured.'))
+			]),
+			E('details', { 'style': 'margin-top:1em' }, [
+				E('summary', {}, _('Technical details')),
+				E('p', {}, _('The template is sent as the message body with the chosen parse_mode, and values put into it are escaped for that mode, so message text is never read as markup. Proxy settings are passed only to this package\'s Telegram transport. Delivery and SIM deletion use persistent state and bounded retries. A network timeout can be ambiguous, so Telegram delivery may occasionally be duplicated, but a SIM message is never deleted before a confirmed Telegram response.'))
+			])
+		]);
+		if (window.HH71) window.HH71.decorate(body);
+		return body;
+	}
+});

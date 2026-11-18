@@ -1,0 +1,526 @@
+#!/bin/sh
+#
+# The netfilter half of VPN mode: hand the LAN's traffic, and the router's own, to the
+# Xray inbounds.  Everything lives in chains of our own, so `down` is exact and a
+# half-applied state cannot survive.
+#
+#   up       install the rules for the current settings
+#   arm      wait for Xray to actually open its redirect port, then `up` -- called
+#            once from start_service(), so the rules are not installed for a
+#            process that has only just been told to start
+#   down     remove every rule and chain we own
+#   restore  re-install them, but only if the service is meant to be up AND is
+#            actually listening (this is what the firewall include calls, because
+#            fw3 deletes foreign chains on reload)
+#   status   print what is actually in the kernel right now
+#
+# Loops are prevented twice over: Xray's own outbound sockets carry a mark that the
+# first rule in every chain returns on, and the resolved server address is excluded by
+# address as well.  Either one alone would do; both cost nothing.
+
+. /lib/functions.sh
+
+IPT="iptables -w"
+IP6T="ip6tables -w"
+STATE_SH=/var/run/xray.state.sh
+
+PRE_NAT=XRAY_PRE
+OUT_NAT=XRAY_OUT
+TP_MANGLE=XRAY_TP
+FWD_FILT=XRAY_FWD
+OUTF_FILT=XRAY_OUTF
+
+PRIVATE4="0.0.0.0/8 10.0.0.0/8 100.64.0.0/10 127.0.0.0/8 169.254.0.0/16 172.16.0.0/12 192.0.0.0/24 192.168.0.0/16 198.18.0.0/15 224.0.0.0/4 240.0.0.0/4"
+
+load_settings() {
+	config_load xray
+	config_get MODE           main mode           vpn
+	config_get ENABLED        main enabled        0
+	config_get REDIR_PORT     main redirect_port  1082
+	config_get TPROXY_PORT    main tproxy_port    1083
+	config_get DNS_PORT       main dns_port       1053
+	config_get LAN_IFACES     main lan_ifaces     ""
+	config_get ROUTER_TRAFFIC main router_traffic 1
+	config_get BLOCK_QUIC     main block_quic     1
+	config_get CAPTURE_UDP    main capture_udp    0
+	config_get BLOCK_IPV6     main block_ipv6     1
+	config_get FWMARK         main fwmark         255
+	config_get TPMARK         main tproxy_mark    1
+	config_get TPTABLE        main tproxy_table   100
+
+	SERVER_IP=""
+	[ -f "$STATE_SH" ] && . "$STATE_SH"
+	SERVER_IP="${XRAY_SERVER_IP:-}"
+
+	resolve_ifaces
+}
+
+# ------------------------------------------------------------ client interfaces
+#
+# Which interfaces carry clients whose traffic is captured.  This is deliberately not
+# a list anyone has to type: the answer is "everything except the way out", and the
+# way out changes by itself on this router - the modem comes and goes, and the single
+# combined port can be LAN or WAN.
+#
+# So the default is worked out here: every interface that has an IPv4 address, minus
+# loopback, minus whatever the default route currently leaves by.  On this board that
+# is `br-lan`, which is the LAN ports **and both Wi-Fi radios** - they are bridge
+# members, so Wi-Fi clients are captured without being named anywhere.
+#
+# An explicit list in the setting overrides all of it, for the person who wants only
+# some of their network tunnelled.
+
+# busybox's `ip route show default` ignores the selector and prints the whole table,
+# so the filtering has to happen here.  Taking it at its word made every interface
+# look like an uplink and left nothing to capture at all.
+uplink_ifaces() {
+	ip route 2>/dev/null | awk '$1 == "default" {
+		for (i = 1; i < NF; i++) if ($i == "dev") print $(i + 1)
+	}' | sort -u
+}
+
+# A bridge is where clients live on this board: br-lan carries the LAN ports and both
+# Wi-Fi radios. A plain interface is not client-facing - eth2 is the modem side - so it
+# is never captured, whether or not it happens to be the way out at the moment.
+is_bridge() {
+	[ -d "/sys/class/net/$1/brif" ]
+}
+
+has_wireless_port() {
+	local port
+	for port in $(ls "/sys/class/net/$1/brif" 2>/dev/null); do
+		case "$port" in wlan*|ra*|wl*) return 0 ;; esac
+	done
+	return 1
+}
+
+# "Everything except the way out" is not quite the rule, and the difference matters on a
+# bench where the internet arrives over the same bridge the clients are on: excluding the
+# uplink then excludes the clients too, and captures the modem side instead. A bridge
+# carrying Wi-Fi is client-facing by definition and is captured even when it is also the
+# way out - the router's own traffic to the gateway is a private destination and bypasses
+# the rules anyway, and Xray's own connection carries the socket mark.
+auto_ifaces() {
+	local up ifn skip
+	up=$(uplink_ifaces)
+	ip -4 -o addr show scope global 2>/dev/null | awk '{print $2}' | cut -d@ -f1 |
+	sort -u | while read -r ifn; do
+		[ -n "$ifn" ] || continue
+		[ "$ifn" = "lo" ] && continue
+		is_bridge "$ifn" || continue
+		if has_wireless_port "$ifn"; then
+			echo "$ifn"
+			continue
+		fi
+		skip=0
+		for u in $up; do [ "$ifn" = "$u" ] && skip=1; done
+		[ "$skip" = 1 ] || echo "$ifn"
+	done
+}
+
+# Sets LAN_IFACES and CAPTURE_MODE in place.  Deliberately not through a command
+# substitution: that runs in a subshell, and CAPTURE_MODE would never come back.
+resolve_ifaces() {
+	case "$LAN_IFACES" in
+		""|auto|AUTO)
+			CAPTURE_MODE=auto
+			LAN_IFACES=$(auto_ifaces | tr '\n' ' ')
+			;;
+		*)
+			CAPTURE_MODE=manual
+			;;
+	esac
+	# Nothing to capture is a state worth naming rather than silently doing nothing:
+	# it means every interface with an address is also the way out.
+	[ -n "$LAN_IFACES" ] || CAPTURE_MODE="$CAPTURE_MODE (nothing to capture)"
+}
+
+# Which of the captured interfaces are bridges carrying a wireless port, so the page
+# can say "Wi-Fi is included" instead of leaving someone to guess.
+wireless_via() {
+	local ifn port
+	for ifn in $LAN_IFACES; do
+		[ -d "/sys/class/net/$ifn/brif" ] || continue
+		for port in $(ls "/sys/class/net/$ifn/brif" 2>/dev/null); do
+			case "$port" in
+				wlan*|ra*|wl*) echo "$ifn:$port" ;;
+			esac
+		done
+	done
+}
+
+have_tproxy() {
+	[ -n "$(ls /lib/modules/*/xt_TPROXY.ko 2>/dev/null)" ] && return 0
+	grep -q '^xt_TPROXY ' /proc/modules 2>/dev/null
+}
+
+# Is anything listening on this TCP port right now, on either address family?
+# Mirrors hh71vm.xray's M.listening() in xray-lib.lua: Go opens a dual-stack
+# wildcard socket, so an inbound bound to 0.0.0.0 shows up in /proc/net/tcp6 as
+# [::]:port and never appears in /proc/net/tcp at all.
+port_listening() {   # port_listening <port>
+	local want f
+	want=$(printf '%04X' "$1")
+	for f in /proc/net/tcp /proc/net/tcp6; do
+		[ -r "$f" ] || continue
+		awk -v want="$want" '
+			NR > 1 {
+				n = length($2)
+				if (substr($2, n - 3) == want && $4 == "0A") { found = 1; exit }
+			}
+			END { exit !found }
+		' "$f" && return 0
+	done
+	return 1
+}
+
+# ---------------------------------------------------------------------------- DNS
+#
+# Measured on the device 2026-09-04, and it is the one thing about this that is not
+# obvious: **a UDP query cannot be redirected straight into Xray.**  With
+# `REDIRECT --to-ports 1053` the query does arrive -- the rule counter moves and Xray
+# answers it correctly when the same query is sent to port 1053 by hand -- but the
+# answer never gets back to the client.  Xray's inbound is a Go dual-stack wildcard
+# socket, so the kernel picks the reply's source address by route, it is not the
+# address conntrack recorded as the original destination, and the reverse NAT never
+# matches.  This is why every proxy package on OpenWrt uses TPROXY for UDP and
+# REDIRECT only for TCP.
+#
+# dnsmasq, on the other hand, binds one socket per address (nonwildcard) and answers
+# from exactly the address the query arrived on, so a redirect to *it* works.  So the
+# LAN's DNS is pointed at dnsmasq, and dnsmasq's own upstream is pointed at Xray's DNS
+# inbound on loopback, where no NAT is involved at all.
+#
+# The override lives in /tmp/dnsmasq.d, which dnsmasq includes and which is a tmpfs:
+# a reboot undoes it by itself, so a crash cannot leave the LAN with a resolver that
+# points at a port nothing is listening on.
+
+DNSMASQ_CONF=/tmp/dnsmasq.d/xray.conf
+
+# `up` runs on every fw3 reload and every interface event, and restarting dnsmasq each
+# time is a short DNS outage for the whole LAN.  It is restarted only when the override
+# actually changes.
+dns_capture() {
+	local want
+	mkdir -p /tmp/dnsmasq.d
+	want="# written by hh71vm-xray-fw; removed when the connection is switched off
+no-resolv
+server=127.0.0.1#${DNS_PORT}"
+	[ "$(cat "$DNSMASQ_CONF" 2>/dev/null)" = "$want" ] && return 0
+	printf '%s\n' "$want" > "$DNSMASQ_CONF"
+	/etc/init.d/dnsmasq restart >/dev/null 2>&1
+}
+
+dns_release() {
+	[ -f "$DNSMASQ_CONF" ] || return 0
+	rm -f "$DNSMASQ_CONF"
+	/etc/init.d/dnsmasq restart >/dev/null 2>&1
+}
+
+# ------------------------------------------------------------------------- chains
+
+flush_chain() {   # flush_chain <table> <chain> [ip6]
+	local t="$1" c="$2" cmd="$IPT"
+	[ "$3" = "ip6" ] && cmd="$IP6T"
+	$cmd -t "$t" -F "$c" 2>/dev/null
+	$cmd -t "$t" -X "$c" 2>/dev/null
+}
+
+new_chain() {     # new_chain <table> <chain> [ip6]
+	local t="$1" c="$2" cmd="$IPT"
+	[ "$3" = "ip6" ] && cmd="$IP6T"
+	$cmd -t "$t" -F "$c" 2>/dev/null || $cmd -t "$t" -N "$c" 2>/dev/null
+	$cmd -t "$t" -F "$c" 2>/dev/null
+}
+
+delete_jumps() {  # delete_jumps <table> <chain> <target> [ip6]
+	local t="$1" c="$2" target="$3" cmd="$IPT" number
+	[ "$4" = "ip6" ] && cmd="$IP6T"
+	while :; do
+		number=$($cmd -t "$t" -L "$c" --line-numbers -n 2>/dev/null |
+			awk -v target="$target" '$2 == target { print $1; exit }')
+		[ -n "$number" ] || break
+		$cmd -t "$t" -D "$c" "$number" 2>/dev/null || break
+	done
+}
+
+unlink_all() {
+	# Remove every jump into our chains first, then the chains themselves. Find
+	# jumps by their target rather than reconstructing them from the current
+	# settings: automatic interface selection can change between `up` and `down`.
+	delete_jumps nat PREROUTING $PRE_NAT
+	delete_jumps mangle PREROUTING $TP_MANGLE
+	delete_jumps filter FORWARD $FWD_FILT
+	delete_jumps nat OUTPUT $OUT_NAT
+	delete_jumps filter OUTPUT $OUTF_FILT
+	delete_jumps filter FORWARD $FWD_FILT ip6
+	delete_jumps filter OUTPUT $OUTF_FILT ip6
+	flush_chain nat $PRE_NAT
+	flush_chain nat $OUT_NAT
+	flush_chain mangle $TP_MANGLE
+	flush_chain filter $FWD_FILT
+	flush_chain filter $OUTF_FILT
+	flush_chain filter $FWD_FILT ip6
+	flush_chain filter $OUTF_FILT ip6
+}
+
+drop_policy_route() {
+	ip rule del fwmark "$TPMARK" lookup "$TPTABLE" 2>/dev/null
+	ip route flush table "$TPTABLE" 2>/dev/null
+}
+
+add_policy_route() {
+	ip rule del fwmark "$TPMARK" lookup "$TPTABLE" 2>/dev/null
+	ip rule add fwmark "$TPMARK" lookup "$TPTABLE" 2>/dev/null || return 1
+	ip route flush table "$TPTABLE" 2>/dev/null
+	ip route add local 0.0.0.0/0 dev lo table "$TPTABLE" 2>/dev/null || return 1
+	return 0
+}
+
+# ----------------------------------------------------------------------------- up
+
+bypass_rules() {  # bypass_rules <table> <chain>
+	local t="$1" c="$2" n
+	$IPT -t "$t" -A "$c" -m mark --mark "$FWMARK" -j RETURN
+	for n in $PRIVATE4; do
+		$IPT -t "$t" -A "$c" -d "$n" -j RETURN
+	done
+	[ -n "$SERVER_IP" ] && $IPT -t "$t" -A "$c" -d "$SERVER_IP" -j RETURN
+	return 0
+}
+
+do_up() {
+	load_settings
+	[ "$MODE" = "vpn" ] || { echo "mode is $MODE: no rules needed"; do_down_quiet; return 0; }
+
+	unlink_all
+	# TPROXY is only installed when it is asked for.  It is off by default because
+	# on this board it captures UDP and then loses it: Xray reads the packet and
+	# tunnels it (the log shows the original destination), the far end answers, and
+	# the reply is never written back - measured 2026-09-04, with a transparent reply
+	# socket created per request (99 of them) and zero packets emitted, while the
+	# same tunnel returns UDP answers correctly through a non-transparent inbound.
+	# Traffic that disappears is worse than traffic that goes out unproxied, so the
+	# default is to leave UDP alone and reject QUIC instead, which pushes browsers
+	# onto TCP.
+	TPROXY_OK=0
+	if [ "$CAPTURE_UDP" = "1" ] && have_tproxy; then
+		if add_policy_route; then TPROXY_OK=1; else drop_policy_route; fi
+	else
+		drop_policy_route
+	fi
+
+	# --- the router's own resolver now answers through the tunnel --------------
+	dns_capture
+
+	# --- TCP and DNS from the LAN, through the nat table -----------------------
+	# Port 53 goes to dnsmasq, not to Xray: see the comment above dns_capture.
+	new_chain nat $PRE_NAT
+	bypass_rules nat $PRE_NAT
+	# Only when UDP is not being captured. mangle PREROUTING runs first and TPROXY
+	# claims the packet, but nat still gets its first packet and a REDIRECT here
+	# DNATs it to dnsmasq afterwards - so the query is delivered to the wrong socket
+	# and the client drops the answer for coming from the wrong address. Measured on
+	# the device: conntrack showed dst rewritten to 192.168.1.1:53 with the TPROXY
+	# rule counter already incremented.
+	if [ "$TPROXY_OK" != "1" ]; then
+		$IPT -t nat -A $PRE_NAT -p udp --dport 53 -j REDIRECT --to-ports 53
+	fi
+	$IPT -t nat -A $PRE_NAT -p tcp --dport 53 -j REDIRECT --to-ports 53
+	$IPT -t nat -A $PRE_NAT -p tcp -j REDIRECT --to-ports "$REDIR_PORT"
+	for ifn in $LAN_IFACES; do
+		$IPT -t nat -I PREROUTING 1 -i "$ifn" -j $PRE_NAT
+	done
+
+	# --- the same for what the router itself starts ----------------------------
+	if [ "$ROUTER_TRAFFIC" = "1" ]; then
+		new_chain nat $OUT_NAT
+		$IPT -t nat -A $OUT_NAT -o lo -j RETURN
+		bypass_rules nat $OUT_NAT
+		$IPT -t nat -A $OUT_NAT -p udp --dport 53 -j REDIRECT --to-ports 53
+		$IPT -t nat -A $OUT_NAT -p tcp --dport 53 -j REDIRECT --to-ports 53
+		$IPT -t nat -A $OUT_NAT -p tcp -j REDIRECT --to-ports "$REDIR_PORT"
+		$IPT -t nat -I OUTPUT 1 -j $OUT_NAT
+	fi
+
+	# --- UDP from the LAN, through TPROXY --------------------------------------
+	if [ "$TPROXY_OK" = "1" ]; then
+		new_chain mangle $TP_MANGLE
+		$IPT -t mangle -A $TP_MANGLE -m mark --mark "$FWMARK" -j RETURN
+		for n in $PRIVATE4; do
+			$IPT -t mangle -A $TP_MANGLE -d "$n" -j RETURN
+		done
+		[ -n "$SERVER_IP" ] && $IPT -t mangle -A $TP_MANGLE -d "$SERVER_IP" -j RETURN
+		$IPT -t mangle -A $TP_MANGLE -p udp -j TPROXY \
+			--on-port "$TPROXY_PORT" --on-ip 127.0.0.1 --tproxy-mark "$TPMARK"
+		for ifn in $LAN_IFACES; do
+			$IPT -t mangle -I PREROUTING 1 -i "$ifn" -j $TP_MANGLE
+		done
+	fi
+
+	# --- what is left of UDP when there is no TPROXY ---------------------------
+	# QUIC would otherwise be the one protocol that quietly leaves unproxied, and a
+	# browser that cannot reach it over UDP falls back to TCP by itself.
+	if [ "$TPROXY_OK" != "1" ] && [ "$BLOCK_QUIC" = "1" ]; then
+		new_chain filter $FWD_FILT
+		$IPT -A $FWD_FILT -p udp --dport 443 -j REJECT --reject-with icmp-port-unreachable
+		$IPT -A $FWD_FILT -p udp --dport 80 -j REJECT --reject-with icmp-port-unreachable
+		for ifn in $LAN_IFACES; do
+			$IPT -I FORWARD 1 -i "$ifn" -j $FWD_FILT
+		done
+		if [ "$ROUTER_TRAFFIC" = "1" ]; then
+			new_chain filter $OUTF_FILT
+			$IPT -A $OUTF_FILT -m mark --mark "$FWMARK" -j RETURN
+			$IPT -A $OUTF_FILT -p udp --dport 443 -j REJECT --reject-with icmp-port-unreachable
+			$IPT -I OUTPUT 1 -j $OUTF_FILT
+		fi
+	fi
+
+	# --- IPv6 has no tunnel here, so it must not have a way out either ----------
+	if [ "$BLOCK_IPV6" = "1" ]; then
+		new_chain filter $FWD_FILT ip6
+		$IP6T -A $FWD_FILT -d 2000::/3 -j REJECT --reject-with adm-prohibited 2>/dev/null || \
+			$IP6T -A $FWD_FILT -d 2000::/3 -j DROP
+		$IP6T -I FORWARD 1 -j $FWD_FILT
+	fi
+
+	echo "vpn rules installed (tproxy=$TPROXY_OK, server=${SERVER_IP:-unresolved}, lan=$LAN_IFACES)"
+	return 0
+}
+
+do_down_quiet() {
+	load_settings 2>/dev/null
+	unlink_all
+	drop_policy_route
+	dns_release
+}
+
+do_down() {
+	do_down_quiet
+	echo "vpn rules removed"
+}
+
+# Called by the firewall include on every fw3 reload (it deletes chains it does not
+# own) and by the iface hotplug when the way out moves. ENABLED=1 only means the
+# connection is *meant* to be up -- it is a UCI setting that survives a reboot, a
+# crashed process, a firmware upgrade that dropped xray-core from the /mnt/extern
+# share, or simply "the service has not started yet this boot". Trusting it alone
+# used to install the TCP redirect and the dnsmasq override for a tunnel that was
+# not actually there, which broke the LAN's DNS and TCP outright instead of leaving
+# it working unproxied -- measured 2026-09-14 (autostart off, Connect pressed in an
+# earlier session: ENABLED stayed 1 across a power cycle, Xray never started this
+# boot, and the plain fw3 reload at boot still ran this and broke DNS). Reinstall
+# only once the redirect port is actually being answered; hh71vm-xray-fw arm (from
+# start_service) and the watchdog's own capture check are what install the rules
+# the moment that becomes true, so nothing is lost by waiting for it here too.
+do_restore() {
+	load_settings
+	if [ "$ENABLED" != "1" ] || [ "$MODE" != "vpn" ]; then
+		# fw3 also reloads after a plain reboot, and that is the moment to make sure
+		# the LAN is not left pointing at a resolver that is not coming back.
+		dns_release
+		return 0
+	fi
+	if port_listening "$REDIR_PORT"; then
+		do_up >/dev/null
+	else
+		# Not just dns_release: this runs from the iface hotplug too, and nothing has
+		# flushed anything on that path. Releasing only the resolver would leave the
+		# nat REDIRECT into a closed port installed -- the LAN's TCP dead while ping
+		# keeps working, which is the exact fail-closed behaviour this whole change
+		# exists to remove. Taking our own rules down is always the safe state: `arm`,
+		# the watchdog and the next reload all reinstall them the moment Xray is
+		# really listening.
+		do_down_quiet
+	fi
+}
+
+# Called once from start_service(), as its own short-lived procd instance, right
+# after the Xray process instance is opened. Installing the capture rules the
+# moment the process is merely *started* raced the binary's own wait for the
+# /mnt/extern share (up to the `wait` setting, 120s by default) and then Xray's own
+# startup -- the same fail-open reasoning as do_restore above, just for the normal
+# boot/Connect path rather than a reload. Waits for the redirect port to actually
+# accept connections before calling `up`, and gives up quietly if that never
+# happens: no rules is the safe state here, not an error anyone has to clear.
+do_arm() {
+	load_settings
+	[ "$MODE" = "vpn" ] || { echo "mode is $MODE: nothing to arm"; return 0; }
+	local wait_for_share limit waited=0
+	config_get wait_for_share main wait 120
+	limit=$((wait_for_share + 60))
+	while [ "$waited" -lt "$limit" ]; do
+		if port_listening "$REDIR_PORT"; then
+			do_up
+			return 0
+		fi
+		sleep 3
+		waited=$((waited + 3))
+	done
+	logger -t hh71vm-xray-fw "Xray never opened its redirect port after ${limit}s; no capture rules installed"
+	return 1
+}
+
+do_status() {
+	load_settings
+	echo "mode:      $MODE"
+	echo "tproxy:    $(have_tproxy && echo available || echo "missing (kmod-ipt-tproxy)")"
+	echo "udp:       $([ "$CAPTURE_UDP" = 1 ] && echo "capture requested" || echo "not captured (default)")"
+	echo "dns:       $([ -f "$DNSMASQ_CONF" ] && echo "dnsmasq -> 127.0.0.1#$DNS_PORT" || echo "unchanged")"
+	echo "capture:   $LAN_IFACES ($CAPTURE_MODE)"
+	echo "uplink:    $(uplink_ifaces | tr '
+' ' ')"
+	echo "wireless:  $(wireless_via | tr '
+' ' ')"
+	echo "server ip: ${SERVER_IP:-unknown}"
+	echo "--- nat PREROUTING/OUTPUT ---"
+	$IPT -t nat -S | grep -E "XRAY_" || echo "(none)"
+	echo "--- mangle ---"
+	$IPT -t mangle -S | grep -E "XRAY_" || echo "(none)"
+	echo "--- filter ---"
+	$IPT -S | grep -E "XRAY_" || echo "(none)"
+	echo "--- policy route ---"
+	ip rule | grep -E "lookup $TPTABLE" || echo "(none)"
+	ip route show table "$TPTABLE" 2>/dev/null || true
+}
+
+do_ifaces() {
+	load_settings
+	echo "mode=$CAPTURE_MODE"
+	echo "ifaces=$LAN_IFACES"
+	echo "uplink=$(uplink_ifaces | tr '
+' ' ')"
+	echo "wireless=$(wireless_via | tr '
+' ' ')"
+}
+
+# One run instead of two.  hh71vm-xrayctl used to call `status` and `ifaces`
+# separately on every LuCI status poll - two full runs of this script, 426 lines,
+# just to get a rule-installed boolean and the capture set. This prints both in a
+# format the Lua side already knows how to parse (it is the same "key=value" shape
+# `ifaces` used), so one exec covers what used to take two.
+do_brief() {
+	load_settings
+	if $IPT -t nat -S 2>/dev/null | grep -q "$PRE_NAT"; then
+		echo "rules=1"
+	else
+		echo "rules=0"
+	fi
+	echo "mode=$CAPTURE_MODE"
+	echo "ifaces=$LAN_IFACES"
+	echo "uplink=$(uplink_ifaces | tr '
+' ' ')"
+	echo "wireless=$(wireless_via | tr '
+' ' ')"
+}
+
+case "${1:-status}" in
+	up)      do_up ;;
+	arm)     do_arm ;;
+	ifaces)  do_ifaces ;;
+	brief)   do_brief ;;
+	down)    do_down ;;
+	restore) do_restore ;;
+	status)  do_status ;;
+	*) echo "usage: $0 {up|arm|down|restore|status|ifaces|brief}" >&2; exit 2 ;;
+esac
