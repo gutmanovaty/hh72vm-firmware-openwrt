@@ -7,6 +7,7 @@ hh71vm-openwrt-flash-bundle/
 # Cloned upstream source repositories (managed separately)
 hh71vm-openwrt/
 unifi-openwrt/
+.tools/
 
 # Device-unique backups and local environment secrets
 backup-stock*/
