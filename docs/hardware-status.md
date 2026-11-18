@@ -73,3 +73,28 @@ Captured and verified via `scripts/backup_stock_http.py` and `install_openwrt_la
 - Bootloader gzip header at `mtd0[0x7D60:0x7D62]` (`1f 8b`): **verified**
 - `install_openwrt_lan.py --dry-run` status: **passed** (`The backup checks out: sizes and md5 match, the bootloader is in place.`)
 
+## 5. OpenWrt Installation & Post-Boot Verification (`Alcatel LINKHUB HH72-V-V2.0`)
+
+Installed via `scripts/flash_openwrt_telnet.py` (`/bin/fwupg check` -> `Firmware upgrade check OK!` -> `/bin/fwupg reboot`).
+
+- **Board & Release (`ubus call system board`):**
+  - `kernel`: `4.14.275`
+  - `system`: `RTL8197F` (`mipsel_24kc`)
+  - `model`: `Alcatel LINKHUB HH72-V-V2.0`
+  - `board_name`: `hh71vm`
+  - `revision`: `hh71vm-r00000000037597446324-a000001-201b0e1782b0`
+  - `target`: `rtkmipsel/rtl8197f`
+- **OpenWrt 7-Partition Flash Layout (`/proc/mtd`):**
+  - `mtd0`: `00020000` (`boot`, 128 KiB)
+  - `mtd1`: `00004000` (`hwsetting`, 16 KiB)
+  - `mtd2`: `0000c000` (`config`, 48 KiB)
+  - `mtd3`: `002d0000` (`kernel`, 2,880 KiB)
+  - `mtd4`: `00300000` (`rootfs`, 3,072 KiB)
+  - `mtd5`: `00600000` (`rootfs_data`, 6,144 KiB)
+  - `mtd6`: `00400000` (`vendor_jffs2`, 4,096 KiB)
+- **Subsystems Verified:**
+  - **Ethernet (`switch0`):** `Port 0` (`1000baseT full-duplex auto`), `Port 6` CPU (`1000baseT full-duplex`), `br-lan` (`192.168.1.1/22`, `dhcp.lan.ignore=1` on shared LAN)
+  - **Wi-Fi (`rtl8192cd`):** `radio0` (`wlan0`, 2.4 GHz `11g` `HT20`, `up: true`), `radio1` (`wlan1`, 5 GHz `11a` `VHT80`, `up: true`)
+  - **Qualcomm LTE Modem (`eth2`):** RNDIS `UP` at `192.168.225.111/24` (gateway `192.168.225.1`)
+
+
