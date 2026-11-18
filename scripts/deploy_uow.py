@@ -74,7 +74,8 @@ start_service() {
 \tprocd_open_instance
 \tprocd_set_param command "$PROG" -ap local \\
 \t\t-mac "$(cat /sys/class/net/br-lan/address)" \\
-\t\t-model "$model" -hostname "${hostname:-HH72VM}" -url "$inform_url" -console "$console_ip" -state "$STATE"
+\t\t-model "$model" -hostname "${hostname:-HH72VM}" -url "$inform_url" -console "$console_ip" -state "$STATE" \\
+\t\t-ssh-listen ":${ssh_port:-2222}"
 \tprocd_set_param respawn 3600 10 5
 \tprocd_set_param stdout 1
 \tprocd_set_param stderr 1
